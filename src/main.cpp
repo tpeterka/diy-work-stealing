@@ -113,8 +113,8 @@ void send_link_info(Block* b,                               // local block
     }
 
     // src block sends info to all blocks linked to it
-    if (b->gid == sent_move_info.move_gid)
-    {
+//     if (b->gid == sent_move_info.move_gid)
+//     {
         for (int i = 0; i < l->size(); ++i)
         {
             cp.enqueue(l->target(i), temp_info);
@@ -122,12 +122,13 @@ void send_link_info(Block* b,                               // local block
                 fmt::print(stderr, "send_link_info(): gid {} enqueing move_gid {}, src_rank {} dst_rank {} to gid {}\n",
                         b->gid, temp_info.move_gid, temp_info.src_rank, temp_info.dest_rank, l->target(i).gid);
         }
-    }
+//     }
 }
 
 // callback for synchronous exchange, receiving link info
 void recv_link_info(Block* b,                               // local block
-                    const diy::Master::ProxyWithLink& cp)   // communication proxy for neighbor blocks
+                    const diy::Master::ProxyWithLink& cp,   // communication proxy for neighbor blocks
+                    diy::Master& master)
 {
     diy::Link*  l = cp.link();                              // link to the neighbor blocks
     MoveInfo    recv_info;
@@ -141,8 +142,16 @@ void recv_link_info(Block* b,                               // local block
             {
                 cp.dequeue(l->target(i).gid, recv_info);
                 if (recv_info.move_gid != -1)
+                {
                     fmt::print(stderr, "recv_link_info(): gid {} recvd_move_gid {} recvd_src_rank {} recvd_dst_rank {} from gid {}\n",
                             b->gid, recv_info.move_gid, recv_info.src_rank, recv_info.dest_rank, l->target(i).gid);
+                    diy::Link* link = master.link(master.lid(b->gid));
+                    for (auto j = 0; j < link->size(); j++)
+                    {
+                        if (link->neighbors()[j].gid == recv_info.move_gid)
+                            link->neighbors()[j].proc = recv_info.dest_rank;
+                    }
+                }
             }
         }
     }
@@ -245,11 +254,13 @@ int main(int argc, char* argv[])
     // copy static assigner to dynamic assigner
     // each rank copies only its local blocks
     // TODO: add a diy copy constructor
-//     diy::DynamicAssigner    dynamic_assigner(world, world.size(), nblocks);
-//     for (auto i = 0; i < master.size(); i++)
-//         dynamic_assigner.set_rank(world.rank(), master.gid(i));
+    diy::DynamicAssigner    dynamic_assigner(world, world.size(), nblocks);
+    for (auto i = 0; i < master.size(); i++)
+        dynamic_assigner.set_rank(world.rank(), master.gid(i));
 
-    // TODO: communicate move information BlockID (src_rank, gid) from src to dst
+    // communicate move information BlockID (src_rank, gid) from src to dst
+
+    // DEPRECATED, can't get p2p receive to probe src rank and receive from it
 //     int move_gid, dest_rank;        // gid of block that is moving and the destination rank
 //     if (world.rank() == 0)          // src knows what it wants to send to whom
 //     {
@@ -286,6 +297,7 @@ int main(int argc, char* argv[])
     master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
             { recv_move_info(b, cp, recvd_move_info); });
 
+    // DEPRECATED, cannot figure out how to communicate remote data over iexchange
 //     master.iexchange(&move_info);
 
     // move the block
@@ -320,17 +332,12 @@ int main(int argc, char* argv[])
 //     }
 
     // update the link
-    // TODO: update the link manually, not using fix
-//     for (auto i = 0; i < master.size(); i++)
-//     {
-//         diy::Link* link = master.link(i);
-//         link->fix(dynamic_assigner);
-//     }
-
+    // TODO: combine following exchange with previous one
     master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
             { send_link_info(b, cp, sent_move_info); });
     master.exchange();
-    master.foreach(&recv_link_info);
+    master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
+            { recv_link_info(b, cp, master); });
 
     // debug: print link after the update
 //     for (auto i = 0; i < master.size(); i++)
@@ -342,29 +349,56 @@ int main(int argc, char* argv[])
 //         fmt::print(stderr, "\n");
 //     }
 
-//     // step 3: move the block from src to dst rank (TODO)
-//     void* send_b;
-//     Block* recv_b;
-//     if (world.rank() == 0)              // assume src rank knows what to send where
+    // step 3: move the block from src to dst rank
+    void* send_b;
+    Block* recv_b;
+    if (world.rank() == sent_move_info.src_rank)
+    {
+        send_b = master.block(master.lid(sent_move_info.move_gid));
+        diy::MemoryBuffer bb;
+        master.saver()(send_b, bb);
+        world.send(sent_move_info.dest_rank, 0, bb.buffer);
+    }
+    else if (world.rank() == recvd_move_info.dest_rank)
+    {
+        recv_b = static_cast<Block*>(master.creator()());
+        diy::MemoryBuffer bb;
+        world.recv(recvd_move_info.src_rank, 0, bb.buffer);
+        recv_b->load(recv_b, bb);
+    }
+
+    // step 4: move the link for the moving block from src to dst rank (TODO)
+    if (world.rank() == sent_move_info.src_rank)
+    {
+        diy::Link* send_link = master.link(master.lid(sent_move_info.move_gid));
+        diy::MemoryBuffer bb;
+        diy::LinkFactory::save(bb, send_link);
+        world.send(sent_move_info.dest_rank, 0, bb.buffer);
+
+        // remove the block from the master
+        // TODO: why doesn't master size decrease?
+        master.release(master.lid(sent_move_info.move_gid));
+        fmt::print(stderr, "master size {}\n", master.size());
+    }
+    else if (world.rank() == recvd_move_info.dest_rank)
+    {
+        diy::MemoryBuffer bb;
+        diy::Link* recv_link;
+        world.recv(recvd_move_info.src_rank, 0, bb.buffer);
+        recv_link = diy::LinkFactory::load(bb);
+
+        // add block to the master
+        master.add(recvd_move_info.move_gid, recv_b, recv_link);
+        fmt::print(stderr, "master size {}\n", master.size());
+    }
+
+    // debug: print link after the block move
+//     for (auto i = 0; i < master.size(); i++)
 //     {
-//         send_b = master.block(master.size() - 1);
-//         diy::MemoryBuffer bb;
-//         master.saver()(send_b, bb);
-//         world.send(1, 0, bb.buffer);
+//         diy::Link* link = master.link(i);
+//         fmt::print(stderr, "after block move gid {} link ", master.gid(i));
+//         for (auto j = 0; j < link->size(); j++)
+//             fmt::print(stderr, "[gid {} proc {}] ", link->neighbors()[j].gid, link->neighbors()[j].proc);
+//         fmt::print(stderr, "\n");
 //     }
-//     else if (world.rank() == 1)         // TODO: rank 1 never learned that it was the dst or who is the src
-//     {
-//         recv_b = static_cast<Block*>(master.creator()());
-//         diy::MemoryBuffer bb;
-//         world.recv(0, 0, bb.buffer);
-//         recv_b->load(recv_b, bb);
-//     }
-// 
-//     // step 4: move the link for the moving block from src to dst rank (TODO)
-// 
-//     // step 5: update master for src and dst ranks (TODO)
-//     if (world.rank() == 0)
-//         master.release(master.size() - 1);
-// //     if (world.rank() == 1)
-// //         master.add(...)
 }
