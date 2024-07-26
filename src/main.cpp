@@ -157,55 +157,6 @@ void recv_link_info(Block* b,                               // local block
     }
 }
 
-// callback for asynchronous iexchange
-// return: true = I'm done unless more work arrives; false = I'm not done, please call me again
-// bool move_info(Block* b,                       // local block
-//          const diy::Master::ProxyWithLink& cp) // communication proxy for neighbor blocks
-// {
-//     diy::Link*    l = cp.link();               // link to the neighbor blocks
-// 
-//     MoveInfo info;
-//     info.move_gid    = 3;
-//     info.src_rank    = 0;
-//     info.dest_rank   = 1;
-//     MoveInfo recvd_info;
-// 
-//     do
-//     {
-//         // src block sends info to some other block in the destination rank
-//         if (cp.gid() == info.move_gid)
-//         {
-//             // enqueue potentially outside of the neighborhood by specifying gid and proc
-//             int dest_gid = bpr;                     // TODO: get the gid of a block on the dest_proc from the assigner
-//             int dest_proc = 1;                      // MPI process of destination block
-//             diy::BlockID dest_block = {dest_gid, dest_proc};
-//             cp.enqueue(dest_block, info);
-//             fmt::print(stderr, "move_info(): enqueing dest_gid {} dest_proc {}\n", dest_gid, dest_proc);
-//         }
-// 
-//         // dequeue incoming data, works even for remote source outside the neighborhood
-//         for (int i = 0; i < l->size(); ++i)
-//         {
-//             std::vector<int> incoming_gids;
-// //             do
-// //             {
-//                 incoming_gids.clear();
-//                 cp.incoming(incoming_gids);
-//                 if (incoming_gids.size() && first_time)     // FIXME
-//                 {
-//                     fmt::print(stderr, "move_info(): incoming_gids [{}]\n", fmt::join(incoming_gids, ","));
-//                     cp.dequeue(incoming_gids[0], recvd_info);
-//                     fmt::print(stderr, "move_info(): recvd_move_gid {} recvd_src_rank {}\n",
-//                             recvd_info.move_gid, recvd_info.src_rank);
-//                     first_time = false;                     // FIXME
-//                 }
-// //             } while (incoming_gids.size());
-//         }
-//     } while (cp.fill_incoming());   // this loop is an optimization
-// 
-//     return true;
-// }
-
 int main(int argc, char* argv[])
 {
     diy::mpi::environment     env(argc, argv);              // diy equivalent of MPI_Init
@@ -259,29 +210,6 @@ int main(int argc, char* argv[])
         dynamic_assigner.set_rank(world.rank(), master.gid(i));
 
     // communicate move information BlockID (src_rank, gid) from src to dst
-
-    // DEPRECATED, can't get p2p receive to probe src rank and receive from it
-//     int move_gid, dest_rank;        // gid of block that is moving and the destination rank
-//     if (world.rank() == 0)          // src knows what it wants to send to whom
-//     {
-//         move_gid = master.gid(master.size() - 1);
-//         dest_rank = 1;
-//         world.ssend(dest_rank, 0, move_gid);
-//     }
-//     else
-//     {
-//         diy::mpi::optional<diy::mpi::status> s;
-//         s = world.iprobe(MPI_ANY_SOURCE, 0);
-//         s = world.recv(MPI_ANY_SOURCE, 0, move_gid);
-//         if (s)
-//         {
-//             fmt::print(stderr, "s = {}\n", s);
-// //             world.recv(s->source(), 0, move_gid);
-// //             world.recv(MPI_ANY_SOURCE, 0, move_gid);
-//             fmt::print(stderr, "rank {} received move_gid {} from source rank {}\n", world.rank(), move_gid, s->source());
-//         }
-//     }
-
     MoveInfo sent_move_info, recvd_move_info;           // information about the block that is moving
     int dest_gid;                                       // gid of block where to send the move_info
     if (world.rank() == 0)                              // src rank knows about the move, TODO: decision logic
@@ -296,40 +224,6 @@ int main(int argc, char* argv[])
     master.exchange(true);                  // true: remote exchange
     master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
             { recv_move_info(b, cp, recvd_move_info); });
-
-    // DEPRECATED, cannot figure out how to communicate remote data over iexchange
-//     master.iexchange(&move_info);
-
-    // move the block
-    // TODO: eventually implement moving a block in a single diy function DynamicAssigner::move_block(gid, src_rank, dst_rank)
-
-    // step 1: update assigner
-
-    // debug: print dynamic assigner before the update
-//     for (auto i = 0; i < nblocks; i++)
-//         fmt::print(stderr, "Dynamic assigner before update: gid {} is on rank {}\n", i, dynamic_assigner.rank(i));
-
-//     if (world.rank() == 0)
-//     {
-//         fmt::print(stderr, "rank 0 is moving gid {} to rank {}\n", sent_move_info.move_gid, sent_move_info.dest_rank);
-//         dynamic_assigner.set_rank(sent_move_info.dest_rank, sent_move_info.move_gid);
-//     }
-
-    // debug: print dynamic assigner after the update
-//     for (auto i = 0; i < nblocks; i++)
-//         fmt::print(stderr, "Dynamic assigner after update: gid {} is on rank {}\n", i, dynamic_assigner.rank(i));
-
-    // step 2: update link on all ranks that link to the moving block
-
-    // debug: print link before the update
-//     for (auto i = 0; i < master.size(); i++)
-//     {
-//         diy::Link* link = master.link(i);
-//         fmt::print(stderr, "before update gid {} link ", master.gid(i));
-//         for (auto j = 0; j < link->size(); j++)
-//             fmt::print(stderr, "[gid {} proc {}] ", link->neighbors()[j].gid, link->neighbors()[j].proc);
-//         fmt::print(stderr, "\n");
-//     }
 
     // update the link
     // TODO: combine following exchange with previous one
@@ -367,7 +261,7 @@ int main(int argc, char* argv[])
         recv_b->load(recv_b, bb);
     }
 
-    // step 4: move the link for the moving block from src to dst rank (TODO)
+    // step 4: move the link for the moving block from src to dst rank and update master on src and dst rank
     if (world.rank() == sent_move_info.src_rank)
     {
         diy::Link* send_link = master.link(master.lid(sent_move_info.move_gid));
