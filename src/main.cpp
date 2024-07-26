@@ -113,8 +113,8 @@ void send_link_info(Block* b,                               // local block
     }
 
     // src block sends info to all blocks linked to it
-//     if (b->gid == sent_move_info.move_gid)
-//     {
+    if (b->gid == sent_move_info.move_gid)
+    {
         for (int i = 0; i < l->size(); ++i)
         {
             cp.enqueue(l->target(i), temp_info);
@@ -122,7 +122,7 @@ void send_link_info(Block* b,                               // local block
                 fmt::print(stderr, "send_link_info(): gid {} enqueing move_gid {}, src_rank {} dst_rank {} to gid {}\n",
                         b->gid, temp_info.move_gid, temp_info.src_rank, temp_info.dest_rank, l->target(i).gid);
         }
-//     }
+    }
 }
 
 // callback for synchronous exchange, receiving link info
