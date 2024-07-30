@@ -79,15 +79,15 @@ void recv_move_info(Block* b,                               // local block
 {
     diy::Link*    l = cp.link();                // link to the neighbor blocks
 
-    // dequeue incoming data, supposedly works even for remote source outside the neighborhood
-    for (int i = 0; i < l->size(); ++i)
+    // dequeue incoming data, including remote source outside the neighborhood
+    std::vector<int> incoming_gids;
+    cp.incoming(incoming_gids);
+    for (size_t i = 0; i < incoming_gids.size(); i++)
     {
-        if (cp.incoming(i).size())
-        {
-            cp.dequeue(l->target(i).gid, recvd_move_info);
-            fmt::print(stderr, "recv_move_info(): recvd_move_gid {} recvd_src_rank {}\n",
-                    recvd_move_info.move_gid, recvd_move_info.src_rank);
-        }
+        int gid = incoming_gids[i];
+        cp.dequeue(gid, recvd_move_info);
+        fmt::print(stderr, "recv_move_info(): recvd_move_gid {} recvd_src_rank {}\n",
+                recvd_move_info.move_gid, recvd_move_info.src_rank);
     }
 }
 
@@ -96,33 +96,18 @@ void send_link_info(Block* b,                               // local block
                     const diy::Master::ProxyWithLink& cp,   // communication proxy for neighbor blocks
                     const MoveInfo& sent_move_info)         // info to be sent
 {
-    diy::Link*    l = cp.link();                // link to the neighbor blocks
-
-    MoveInfo temp_info;
-    if (b->gid == sent_move_info.move_gid)
-    {
-        temp_info.move_gid  = sent_move_info.move_gid;
-        temp_info.src_rank  = sent_move_info.src_rank;
-        temp_info.dest_rank = sent_move_info.dest_rank;
-    }
-    else
-    {
-        temp_info.move_gid  = -1;
-        temp_info.src_rank  = -1;
-        temp_info.dest_rank = -1;
-    }
+    diy::Link*    l = cp.link();                            // link to the neighbor blocks
 
     // src block sends info to all blocks linked to it
-//     if (b->gid == sent_move_info.move_gid)
-//     {
+    if (b->gid == sent_move_info.move_gid)
+    {
         for (int i = 0; i < l->size(); ++i)
         {
-            cp.enqueue(l->target(i), temp_info);
-            if (temp_info.move_gid != -1)
-                fmt::print(stderr, "send_link_info(): gid {} enqueing move_gid {}, src_rank {} dst_rank {} to gid {}\n",
-                        b->gid, temp_info.move_gid, temp_info.src_rank, temp_info.dest_rank, l->target(i).gid);
+            cp.enqueue(l->target(i), sent_move_info);
+            fmt::print(stderr, "send_link_info(): gid {} enqueing move_gid {}, src_rank {} dst_rank {} to gid {}\n",
+                b->gid, sent_move_info.move_gid, sent_move_info.src_rank, sent_move_info.dest_rank, l->target(i).gid);
         }
-//     }
+    }
 }
 
 // callback for synchronous exchange, receiving link info
@@ -136,19 +121,19 @@ void recv_link_info(Block* b,                               // local block
     // dequeue incoming data
     for (int i = 0; i < l->size(); ++i)
     {
-        if (l->target(i).gid != b->gid && cp.incoming(i).size())
+        int gid = l->target(i).gid;
+        if (cp.incoming(gid).size())
         {
-            cp.dequeue(l->target(i).gid, recv_info);
-            if (recv_info.move_gid != -1)
+            cp.dequeue(gid, recv_info);
+            fmt::print(stderr, "recv_link_info(): gid {} recvd_move_gid {} recvd_src_rank {} recvd_dst_rank {} from gid {}\n",
+                    b->gid, recv_info.move_gid, recv_info.src_rank, recv_info.dest_rank, l->target(i).gid);
+
+            // update the link
+            diy::Link* link = master.link(master.lid(b->gid));
+            for (auto j = 0; j < link->size(); j++)
             {
-                fmt::print(stderr, "recv_link_info(): gid {} recvd_move_gid {} recvd_src_rank {} recvd_dst_rank {} from gid {}\n",
-                        b->gid, recv_info.move_gid, recv_info.src_rank, recv_info.dest_rank, l->target(i).gid);
-                diy::Link* link = master.link(master.lid(b->gid));
-                for (auto j = 0; j < link->size(); j++)
-                {
-                    if (link->neighbors()[j].gid == recv_info.move_gid)
-                        link->neighbors()[j].proc = recv_info.dest_rank;
-                }
+                if (link->neighbors()[j].gid == recv_info.move_gid)
+                    link->neighbors()[j].proc = recv_info.dest_rank;
             }
         }
     }
@@ -159,7 +144,7 @@ int main(int argc, char* argv[])
     diy::mpi::environment     env(argc, argv);              // diy equivalent of MPI_Init
     diy::mpi::communicator    world;                        // diy equivalent of MPI communicator
 
-    int bpr = 4;                // blocks per rank
+    int bpr = 8;                // blocks per rank
 
     int                       nblocks = world.size() * bpr; // total number of blocks in global domain
     diy::ContiguousAssigner   static_assigner(world.size(), nblocks);
@@ -193,7 +178,7 @@ int main(int argc, char* argv[])
                              b->gid         = gid;
                              b->bounds      = bounds;
 
-                             master.add(gid, b, l);    // add block to the master (mandatory)
+                             master.add(gid, b, l);
                          });
 
     // debug: display the decomposition
@@ -267,8 +252,9 @@ int main(int argc, char* argv[])
         world.send(sent_move_info.dest_rank, 0, bb.buffer);
 
         // remove the block from the master
-        // TODO: why doesn't master size decrease?
         master.release(master.lid(sent_move_info.move_gid));
+
+        // debug
         fmt::print(stderr, "master size {}\n", master.size());
     }
     else if (world.rank() == recvd_move_info.dest_rank)
@@ -280,6 +266,8 @@ int main(int argc, char* argv[])
 
         // add block to the master
         master.add(recvd_move_info.move_gid, recv_b, recv_link);
+
+        // debug
         fmt::print(stderr, "master size {}\n", master.size());
     }
 
