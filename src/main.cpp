@@ -16,6 +16,7 @@ struct MoveInfo
     int move_gid;
     int src_rank;
     int dest_rank;
+    bool block_info;     // whether this message is about the moving block or about the links to it
 };
 
 // the block structure
@@ -55,85 +56,85 @@ struct Block
     std::vector<double> x;               // some block data, e.g.
 };
 
-// callback for synchronous exchange, sending move info
-void send_move_info(Block* b,                               // local block
-                    const diy::Master::ProxyWithLink& cp,   // communication proxy for neighbor blocks
-                    const MoveInfo& sent_move_info,         // info to be sent
-                    int dest_gid)                           // gid of block on destination rank where to send the info
+// callback for synchronous exchange, sending block move info and link info
+void send_info(Block*                               b,              // local block
+               const diy::Master::ProxyWithLink&    cp,             // communication proxy for neighbor blocks
+               MoveInfo&                            sent_move_info, // info to be sent
+               int                                  dest_gid)       // gid of block on destination rank where to send the info
 {
-    // src block sends info to some other block in the destination rank
+    // send block move info from src block to some other block on the destination rank
+    sent_move_info.block_info = true;
     if (b->gid == sent_move_info.move_gid)
     {
         // enqueue potentially outside of the neighborhood by specifying gid and proc
         diy::BlockID dest_block = {dest_gid, sent_move_info.dest_rank};
         cp.enqueue(dest_block, sent_move_info);
-        fmt::print(stderr, "send_move_info(): enqueing move_gid {}, src_rank {} to dest_gid {} dest_rank {}\n",
-                sent_move_info.move_gid, sent_move_info.src_rank, dest_gid, sent_move_info.dest_rank);
+
+        // debug
+//         fmt::print(stderr, "send_info(): move info: gid {} enqueing move_gid {}, src_rank {} to dest_gid {} dest_rank {}\n",
+//                 b->gid, sent_move_info.move_gid, sent_move_info.src_rank, dest_gid, sent_move_info.dest_rank);
     }
-}
 
-// callback for synchronous exchange, receiving move info
-void recv_move_info(Block* b,                               // local block
-                    const diy::Master::ProxyWithLink& cp,   // communication proxy for neighbor blocks
-                    MoveInfo& recvd_move_info)
-{
-    diy::Link*    l = cp.link();                // link to the neighbor blocks
-
-    // dequeue incoming data, including remote source outside the neighborhood
-    std::vector<int> incoming_gids;
-    cp.incoming(incoming_gids);
-    for (size_t i = 0; i < incoming_gids.size(); i++)
-    {
-        int gid = incoming_gids[i];
-        cp.dequeue(gid, recvd_move_info);
-        fmt::print(stderr, "recv_move_info(): recvd_move_gid {} recvd_src_rank {}\n",
-                recvd_move_info.move_gid, recvd_move_info.src_rank);
-    }
-}
-
-// callback for synchronous exchange, sending link info
-void send_link_info(Block* b,                               // local block
-                    const diy::Master::ProxyWithLink& cp,   // communication proxy for neighbor blocks
-                    const MoveInfo& sent_move_info)         // info to be sent
-{
+    // send link info from src block to all blocks linked to it
+    sent_move_info.block_info = false;
     diy::Link*    l = cp.link();                            // link to the neighbor blocks
-
-    // src block sends info to all blocks linked to it
     if (b->gid == sent_move_info.move_gid)
     {
         for (int i = 0; i < l->size(); ++i)
         {
             cp.enqueue(l->target(i), sent_move_info);
-            fmt::print(stderr, "send_link_info(): gid {} enqueing move_gid {}, src_rank {} dst_rank {} to gid {}\n",
-                b->gid, sent_move_info.move_gid, sent_move_info.src_rank, sent_move_info.dest_rank, l->target(i).gid);
+
+            // debug
+//             fmt::print(stderr, "send_info(): link info: gid {} enqueing move_gid {}, src_rank {} dst_rank {} to gid {}\n",
+//                 b->gid, sent_move_info.move_gid, sent_move_info.src_rank, sent_move_info.dest_rank, l->target(i).gid);
         }
     }
 }
 
-// callback for synchronous exchange, receiving link info
-void recv_link_info(Block* b,                               // local block
-                    const diy::Master::ProxyWithLink& cp,   // communication proxy for neighbor blocks
-                    diy::Master& master)
+// callback for synchronous exchange, receiving move info and link info
+void recv_info(Block*                               b,                  // local block
+               const diy::Master::ProxyWithLink&    cp,                 // communication proxy for neighbor blocks
+               MoveInfo&                            recvd_move_info,    // (output) received info
+               diy::Master&                         master)
 {
-    diy::Link*  l = cp.link();                              // link to the neighbor blocks
+    diy::Link*  l = cp.link();                                          // link to the neighbor blocks
     MoveInfo    recv_info;
 
-    // dequeue incoming data
-    for (int i = 0; i < l->size(); ++i)
+    // dequeue move and link info, including remote source outside the neighborhood
+    std::vector<int> incoming_gids;
+    cp.incoming(incoming_gids);
+    for (size_t i = 0; i < incoming_gids.size(); i++)
     {
-        int gid = l->target(i).gid;
-        if (cp.incoming(gid).size())
+        int gid = incoming_gids[i];
+        cp.dequeue(gid, recv_info);
+        if (recv_info.block_info)                                       // this message was about the block being moved
         {
-            cp.dequeue(gid, recv_info);
-            fmt::print(stderr, "recv_link_info(): gid {} recvd_move_gid {} recvd_src_rank {} recvd_dst_rank {} from gid {}\n",
-                    b->gid, recv_info.move_gid, recv_info.src_rank, recv_info.dest_rank, l->target(i).gid);
+            recvd_move_info.move_gid    = recv_info.move_gid;
+            recvd_move_info.src_rank    = recv_info.src_rank;
+            recvd_move_info.dest_rank   = recv_info.dest_rank;
+            recvd_move_info.block_info  = recv_info.block_info;
 
-            // update the link
-            diy::Link* link = master.link(master.lid(b->gid));
-            for (auto j = 0; j < link->size(); j++)
+            // debug
+//             fmt::print(stderr, "recv_info(): move_info: gid {} recvd_move_gid {} recvd_src_rank {}\n",
+//                     b->gid, recvd_move_info.move_gid, recvd_move_info.src_rank);
+        }
+        else                                                            // this message was about the links to the moving block
+        {
+            if (cp.incoming(gid).size())
             {
-                if (link->neighbors()[j].gid == recv_info.move_gid)
-                    link->neighbors()[j].proc = recv_info.dest_rank;
+                cp.dequeue(gid, recv_info);
+
+                // update the link
+                diy::Link* link = master.link(master.lid(b->gid));
+                for (auto j = 0; j < link->size(); j++)
+                {
+                    if (link->neighbors()[j].gid == recv_info.move_gid)
+                        link->neighbors()[j].proc = recv_info.dest_rank;
+                }
+
+                // debug
+//                 fmt::print(stderr, "recv_info(): link_info: gid {} recvd_move_gid {} recvd_src_rank {} recvd_dst_rank {} from gid {}\n",
+//                         b->gid, recv_info.move_gid, recv_info.src_rank, recv_info.dest_rank, l->target(i).gid);
             }
         }
     }
@@ -184,14 +185,14 @@ int main(int argc, char* argv[])
     // debug: display the decomposition
 //     master.foreach(&Block::show_block);
 
-    // step 0: copy static assigner to dynamic assigner
+    // step 1: copy static assigner to dynamic assigner
     // each rank copies only its local blocks
     // TODO: add a diy copy constructor
     diy::DynamicAssigner    dynamic_assigner(world, world.size(), nblocks);
     for (auto i = 0; i < master.size(); i++)
         dynamic_assigner.set_rank(world.rank(), master.gid(i));
 
-    // step 1: communicate info about the block moving from src to dst rank
+    // step 2: communicate info about the block moving from src to dst rank
     MoveInfo sent_move_info, recvd_move_info;           // information about the block that is moving
     int dest_gid;                                       // gid of block where to send the move_info
     if (world.rank() == 0)                              // src rank knows about the move, TODO: decision logic
@@ -200,30 +201,21 @@ int main(int argc, char* argv[])
         sent_move_info.src_rank     = 0;
         sent_move_info.dest_rank    = 1;
         dest_gid                    = bpr;              // TODO: get this from the assigner
+
+        // debug
+        fmt::print(stderr, "rank {} moving block gid {} to rank {}\n",
+                sent_move_info.src_rank, sent_move_info.move_gid, sent_move_info.dest_rank);
     }
     master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
-            { send_move_info(b, cp, sent_move_info, dest_gid); });
+            { send_info(b, cp, sent_move_info, dest_gid); });
     master.exchange(true);                  // true: remote exchange
     master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
-            { recv_move_info(b, cp, recvd_move_info); });
+            { recv_info(b, cp, recvd_move_info, master); });
 
-    // step 2: update the link for any block linked to the block moving
-    // TODO: combine following exchange with previous one
-    master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
-            { send_link_info(b, cp, sent_move_info); });
-    master.exchange();
-    master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
-            { recv_link_info(b, cp, master); });
-
-    // debug: print link after the update
-//     for (auto i = 0; i < master.size(); i++)
-//     {
-//         diy::Link* link = master.link(i);
-//         fmt::print(stderr, "after update gid {} link ", master.gid(i));
-//         for (auto j = 0; j < link->size(); j++)
-//             fmt::print(stderr, "[gid {} proc {}] ", link->neighbors()[j].gid, link->neighbors()[j].proc);
-//         fmt::print(stderr, "\n");
-//     }
+    // debug
+    if (world.rank() == recvd_move_info.dest_rank)
+    fmt::print(stderr, "rank {} getting block gid {} from rank {}\n",
+            recvd_move_info.dest_rank, recvd_move_info.move_gid, recvd_move_info.src_rank);
 
     // step 3: move the block from src to dst rank
     void* send_b;
@@ -252,10 +244,14 @@ int main(int argc, char* argv[])
         world.send(sent_move_info.dest_rank, 0, bb.buffer);
 
         // remove the block from the master
+        Block* delete_block = static_cast<Block*>(master.get(master.lid(sent_move_info.move_gid)));
         master.release(master.lid(sent_move_info.move_gid));
+        delete delete_block;
 
         // debug
         fmt::print(stderr, "master size {}\n", master.size());
+        for (auto i = 0; i < master.size(); i++)
+            fmt::print(stderr, "lid {} gid {}\n", i, master.gid(i));
     }
     else if (world.rank() == recvd_move_info.dest_rank)
     {
@@ -269,6 +265,8 @@ int main(int argc, char* argv[])
 
         // debug
         fmt::print(stderr, "master size {}\n", master.size());
+        for (auto i = 0; i < master.size(); i++)
+            fmt::print(stderr, "lid {} gid {}\n", i, master.gid(i));
     }
 
     // debug: print link after the block move
