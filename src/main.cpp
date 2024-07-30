@@ -134,23 +134,20 @@ void recv_link_info(Block* b,                               // local block
     MoveInfo    recv_info;
 
     // dequeue incoming data
-    if (b->gid != 3)
+    for (int i = 0; i < l->size(); ++i)
     {
-        for (int i = 0; i < l->size(); ++i)
+        if (l->target(i).gid != b->gid && cp.incoming(i).size())
         {
-            if (l->target(i).gid != b->gid && cp.incoming(i).size())
+            cp.dequeue(l->target(i).gid, recv_info);
+            if (recv_info.move_gid != -1)
             {
-                cp.dequeue(l->target(i).gid, recv_info);
-                if (recv_info.move_gid != -1)
+                fmt::print(stderr, "recv_link_info(): gid {} recvd_move_gid {} recvd_src_rank {} recvd_dst_rank {} from gid {}\n",
+                        b->gid, recv_info.move_gid, recv_info.src_rank, recv_info.dest_rank, l->target(i).gid);
+                diy::Link* link = master.link(master.lid(b->gid));
+                for (auto j = 0; j < link->size(); j++)
                 {
-                    fmt::print(stderr, "recv_link_info(): gid {} recvd_move_gid {} recvd_src_rank {} recvd_dst_rank {} from gid {}\n",
-                            b->gid, recv_info.move_gid, recv_info.src_rank, recv_info.dest_rank, l->target(i).gid);
-                    diy::Link* link = master.link(master.lid(b->gid));
-                    for (auto j = 0; j < link->size(); j++)
-                    {
-                        if (link->neighbors()[j].gid == recv_info.move_gid)
-                            link->neighbors()[j].proc = recv_info.dest_rank;
-                    }
+                    if (link->neighbors()[j].gid == recv_info.move_gid)
+                        link->neighbors()[j].proc = recv_info.dest_rank;
                 }
             }
         }
@@ -202,14 +199,14 @@ int main(int argc, char* argv[])
     // debug: display the decomposition
 //     master.foreach(&Block::show_block);
 
-    // copy static assigner to dynamic assigner
+    // step 0: copy static assigner to dynamic assigner
     // each rank copies only its local blocks
     // TODO: add a diy copy constructor
     diy::DynamicAssigner    dynamic_assigner(world, world.size(), nblocks);
     for (auto i = 0; i < master.size(); i++)
         dynamic_assigner.set_rank(world.rank(), master.gid(i));
 
-    // communicate move information BlockID (src_rank, gid) from src to dst
+    // step 1: communicate info about the block moving from src to dst rank
     MoveInfo sent_move_info, recvd_move_info;           // information about the block that is moving
     int dest_gid;                                       // gid of block where to send the move_info
     if (world.rank() == 0)                              // src rank knows about the move, TODO: decision logic
@@ -225,7 +222,7 @@ int main(int argc, char* argv[])
     master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
             { recv_move_info(b, cp, recvd_move_info); });
 
-    // update the link
+    // step 2: update the link for any block linked to the block moving
     // TODO: combine following exchange with previous one
     master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
             { send_link_info(b, cp, sent_move_info); });
