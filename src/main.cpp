@@ -80,7 +80,7 @@ void send_info(Block*                               b,                  // local
     diy::Link*    l = cp.link();                                        // link to the neighbor blocks
     if (b->gid == sent_move_info.move_gid)
     {
-        for (int i = 0; i < l->size(); ++i)
+        for (auto i = 0; i < l->size(); ++i)
         {
             cp.enqueue(l->target(i), sent_move_info);
 
@@ -97,13 +97,12 @@ void recv_info(Block*                               b,                  // local
                MoveInfo&                            recvd_move_info,    // (output) received info
                diy::Master&                         master)
 {
-    diy::Link*  l = cp.link();                                          // link to the neighbor blocks
     MoveInfo    recv_info;
 
     // dequeue move and link info, including remote source outside the neighborhood
     std::vector<int> incoming_gids;
     cp.incoming(incoming_gids);
-    for (size_t i = 0; i < incoming_gids.size(); i++)
+    for (auto i = 0; i < incoming_gids.size(); i++)
     {
         int gid = incoming_gids[i];
         cp.dequeue(gid, recv_info);
@@ -142,16 +141,21 @@ void recv_info(Block*                               b,                  // local
 
 // set dynamic assigner blocks to local blocks of master
 // TODO: make a version of DynamicAssigner ctor take master as an arg and do this
-void SetDynamicAssigner(diy::DynamicAssigner&   dynamic_assigner,
+void set_dynamic_assigner(diy::DynamicAssigner&   dynamic_assigner,
                         diy::Master&            master)
 {
+    std::vector<std::tuple<int, int>> rank_gids(master.size());
+    int rank = master.communicator().rank();
+
     for (auto i = 0; i < master.size(); i++)
-        dynamic_assigner.set_rank(master.communicator().rank(), master.gid(i));
+        rank_gids[i] = std::make_tuple(rank, master.gid(i));
+
+    dynamic_assigner.set_ranks(rank_gids);
 }
 
 // move one block from src to dst proc
 // TODO: make this a member function of dynamic assigner
-void MoveBlock(diy::DynamicAssigner&    assigner,
+void move_block(diy::DynamicAssigner&    assigner,
                diy::Master&             master,
                int&                     move_gid,                       // input/output, updated at the dst proc
                int&                     src_proc,                       // input/output, updated at the dst proc
@@ -312,10 +316,12 @@ int main(int argc, char* argv[])
 
     // copy static assigner to dynamic assigner
     diy::DynamicAssigner    dynamic_assigner(world, world.size(), nblocks);
-    SetDynamicAssigner(dynamic_assigner, master);                       // TODO: make a version of DynamicAssigner ctor take master and do this
+    set_dynamic_assigner(dynamic_assigner, master);                       // TODO: make a version of DynamicAssigner ctor take master and do this
+
+    world.barrier();
 
     // move one block from src to dst proc
-    MoveBlock(dynamic_assigner, master, move_gid, src_proc, dst_proc);  // TODO: make this a dynamic assigner member function
+    move_block(dynamic_assigner, master, move_gid, src_proc, dst_proc);  // TODO: make this a dynamic assigner member function
 
     // debug: print the master of src and dst proc
     if (world.rank() == src_proc)
