@@ -6,17 +6,30 @@
 #include <diy/assigner.hpp>
 #include <diy/master.hpp>
 
+#include "opts.h"
+
+#define WORK_MAX    100                 // maximum work a block can have (in some user-defined units)
+
 typedef     diy::DiscreteBounds         Bounds;
 typedef     diy::RegularGridLink        RGLink;
+
+// information about a process' workload
+struct WorkInfo
+{
+    int proc_rank;          // mpi rank of this process
+    int top_gid;            // gid of most expensive block in this process TODO: can be top-k-gids, as long as k is fixed and known by all
+    int top_work;           // work of top_gid TODO: can be vector of top-k work, as long as k is fixed and known by all
+    int proc_work;          // total work of this process
+};
 
 // information about a block that is moving
 struct MoveInfo
 {
     MoveInfo(): move_gid(-1), src_proc(-1), dst_proc(-1)   {}
+    MoveInfo(int move_gid_, int src_proc_, int dst_proc_) : move_gid(move_gid_), src_proc(src_proc_), dst_proc(dst_proc_) {}
     int move_gid;
     int src_proc;
     int dst_proc;
-    bool block_info;                                                    // whether this message is about the moving block or about the links to it
 };
 
 // the block structure
@@ -46,95 +59,153 @@ struct Block
 
     void show_block(const diy::Master::ProxyWithLink& cp)
     {
-        fmt::print(stderr, "Block {} bounds min [{}] max [{}]\n",
-                cp.gid(), bounds.min, bounds.max);
+        fmt::print(stderr, "Block {} bounds min [{}] max [{}] work {}\n",
+                gid, bounds.min, bounds.max, work);
+    }
+
+    void compute(const diy::Master::ProxyWithLink&  cp,
+                 int                                max_time,               // maximum time for a block to compute
+                 int                                iter)                   // curent iteration
+    {
+        useconds_t usec = max_time * work * 10000;
+
+        // debug
+        fmt::print(stderr, "itertion {} block gid {} computing for {} s.\n", iter, gid, double(usec) / 1e6);
+
+        usleep(usec);
     }
 
     // the block data
-    int gid;
-    Bounds bounds;
+    int                 gid;
+    Bounds              bounds;
     std::vector<double> x;                                              // some block data, e.g.
+    int                 work;                                           // some estimate of how much work this block involves
 };
 
-// callback for synchronous exchange, sending block move info and link info
-void send_info(Block*                               b,                  // local block
-               const diy::Master::ProxyWithLink&    cp,                 // communication proxy for neighbor blocks
-               MoveInfo&                            sent_move_info,     // info to be sent
-               int                                  dest_gid)           // gid of block on destination proc where to send the info
+// exchange work information among all processes
+void exchange_work_info(const   diy::Master& master,
+                        int&    move_gid,                               // (output) block that will migrate
+                        int&    src_proc,                               // (output) src proc that will send move_gid
+                        int&    dst_proc)                               // (output) dst proc that will receive move_gid
 {
-    // send block move info from src block to some other block on the destination proc
-    sent_move_info.block_info = true;
-    if (b->gid == sent_move_info.move_gid)
-    {
-        // enqueue potentially outside of the neighborhood by specifying gid and proc
-        diy::BlockID dest_block = {dest_gid, sent_move_info.dst_proc};
-        cp.enqueue(dest_block, sent_move_info);
+    WorkInfo                my_work_info = {master.communicator().rank(), -1, 0, 0};
+    std::vector<WorkInfo>   all_work_info;
 
-        // debug
-//         fmt::print(stderr, "send_info(): move info: gid {} enqueing move_gid {}, src_proc {} to dest_gid {} dst_proc {}\n",
-//                 b->gid, sent_move_info.move_gid, sent_move_info.src_proc, dest_gid, sent_move_info.dst_proc);
+    // compile my work info
+    for (auto i = 0; i < master.size(); i++)
+    {
+        Block* block = static_cast<Block*>(master.block(i));
+        my_work_info.proc_work += block->work;
+        if (my_work_info.top_gid == -1 || my_work_info.top_work < block->work)
+        {
+            my_work_info.top_gid    = block->gid;
+            my_work_info.top_work   = block->work;
+        }
     }
 
+    // debug
+//     fmt::print(stderr, "exchange_work_info(): proc_rank {} top_gid {} top_work {} proc_work {}\n",
+//             my_work_info.proc_rank, my_work_info.top_gid, my_work_info.top_work, my_work_info.proc_work);
+
+    // vectors of integers from WorkInfo  TODO: how to all_gather WorkInfo directly
+    std::vector<int>                my_work_info_vec(4);
+    std::vector<std::vector<int>>   all_work_info_vec;
+    my_work_info_vec[0] = my_work_info.proc_rank;
+    my_work_info_vec[1] = my_work_info.top_gid;
+    my_work_info_vec[2] = my_work_info.top_work;
+    my_work_info_vec[3] = my_work_info.proc_work;
+
+    // exchange work info TODO: use something like down-up-down tree in IExchangeInfoCollective?
+    diy::mpi::all_gather(master.communicator(), my_work_info_vec, all_work_info_vec);
+
+    // TODO: how to compile this:
+//     diy::mpi::all_gather(master.communicator(), my_work_info, all_work_info);
+
+    // parse all_work_info to decide block migration, all procs arrive at the same decision
+    // for now pick the proc with the max. total work and move its top_gid to the proc with the min. total work
+    // TODO later we can be more sophisticated, e.g., cut the work difference in half, or make this decision a callback function defined by the user
+    WorkInfo max_work = {-1, -1, 0, 0};
+    WorkInfo min_work = {-1, -1, 0, 0};
+    WorkInfo work_info;
+    for (auto i = 0; i < master.communicator().size(); i++)             // for all process ranks
+    {
+        work_info.proc_rank = all_work_info_vec[i][0];
+        work_info.top_gid   = all_work_info_vec[i][1];
+        work_info.top_work  = all_work_info_vec[i][2];
+        work_info.proc_work = all_work_info_vec[i][3];
+
+        if (max_work.proc_rank == -1 || work_info.proc_work > max_work.proc_work)
+        {
+            max_work.proc_rank  = work_info.proc_rank;
+            max_work.top_gid    = work_info.top_gid;
+            max_work.top_work   = work_info.top_work;
+            max_work.proc_work  = work_info.proc_work;
+        }
+        if (min_work.proc_rank == -1 || work_info.proc_work < min_work.proc_work)
+        {
+            min_work.proc_rank  = work_info.proc_rank;
+            min_work.top_gid    = work_info.top_gid;
+            min_work.top_work   = work_info.top_work;
+            min_work.proc_work  = work_info.proc_work;
+        }
+    }
+
+    move_gid    = max_work.top_gid;
+    src_proc    = max_work.proc_rank;
+    dst_proc    = min_work.proc_rank;
+
+    // debug
+    if (master.communicator().rank() == src_proc)
+        fmt::print(stderr, "exchange_work_info(): move_gid {} src_proc {} dst_proc {}\n",
+                move_gid, src_proc, dst_proc);
+}
+
+// callback for synchronous exchange, sending link info
+void send_link_info(Block*                               b,                  // local block
+               const diy::Master::ProxyWithLink&    cp,                 // communication proxy for neighbor blocks
+               MoveInfo&                            move_info)     // info to be sent
+{
     // send link info from src block to all blocks linked to it
-    sent_move_info.block_info = false;
     diy::Link*    l = cp.link();                                        // link to the neighbor blocks
-    if (b->gid == sent_move_info.move_gid)
+    if (b->gid == move_info.move_gid)
     {
         for (auto i = 0; i < l->size(); ++i)
         {
-            cp.enqueue(l->target(i), sent_move_info);
+            cp.enqueue(l->target(i), move_info);
 
             // debug
 //             fmt::print(stderr, "send_info(): link info: gid {} enqueing move_gid {}, src_proc {} dst_proc {} to gid {}\n",
-//                 b->gid, sent_move_info.move_gid, sent_move_info.src_proc, sent_move_info.dst_proc, l->target(i).gid);
+//                 b->gid, move_info.move_gid, move_info.src_proc, move_info.dst_proc, l->target(i).gid);
         }
     }
 }
 
-// callback for synchronous exchange, receiving move info and link info
-void recv_info(Block*                               b,                  // local block
+// callback for synchronous exchange, receiving link info
+void recv_link_info(Block*                               b,                  // local block
                const diy::Master::ProxyWithLink&    cp,                 // communication proxy for neighbor blocks
-               MoveInfo&                            recvd_move_info,    // (output) received info
                diy::Master&                         master)
 {
-    MoveInfo    recv_info;
+    MoveInfo    move_info;
 
-    // dequeue move and link info, including remote source outside the neighborhood
-    std::vector<int> incoming_gids;
-    cp.incoming(incoming_gids);
-    for (auto i = 0; i < incoming_gids.size(); i++)
+    diy::Link*    l = cp.link();
+    for (int i = 0; i < l->size(); ++i)
     {
-        int gid = incoming_gids[i];
-        cp.dequeue(gid, recv_info);
-        if (recv_info.block_info)                                       // this message was about the block being moved
+        int gid = l->target(i).gid;
+        if (cp.incoming(gid).size())
         {
-            recvd_move_info.move_gid    = recv_info.move_gid;
-            recvd_move_info.src_proc    = recv_info.src_proc;
-            recvd_move_info.dst_proc    = recv_info.dst_proc;
-            recvd_move_info.block_info  = recv_info.block_info;
+            cp.dequeue(gid, move_info);
+
+            // update the link
+            diy::Link* link = master.link(master.lid(b->gid));
+            for (auto j = 0; j < link->size(); j++)
+            {
+                if (link->neighbors()[j].gid == move_info.move_gid)
+                    link->neighbors()[j].proc = move_info.dst_proc;
+            }
 
             // debug
-//             fmt::print(stderr, "recv_info(): move_info: gid {} recvd_move_gid {} recvd_src_proc {}\n",
-//                     b->gid, recvd_move_info.move_gid, recvd_move_info.src_proc);
-        }
-        else                                                            // this message was about the links to the moving block
-        {
-            if (cp.incoming(gid).size())
-            {
-                cp.dequeue(gid, recv_info);
-
-                // update the link
-                diy::Link* link = master.link(master.lid(b->gid));
-                for (auto j = 0; j < link->size(); j++)
-                {
-                    if (link->neighbors()[j].gid == recv_info.move_gid)
-                        link->neighbors()[j].proc = recv_info.dst_proc;
-                }
-
-                // debug
-//                 fmt::print(stderr, "recv_info(): link_info: gid {} recvd_move_gid {} recvd_src_proc {} recvd_dst_proc {} from gid {}\n",
-//                         b->gid, recv_info.move_gid, recv_info.src_proc, recv_info.dst_proc, l->target(i).gid);
-            }
+//          fmt::print(stderr, "recv_info(): link_info: gid {} recvd_move_gid {} recvd_src_proc {} recvd_dst_proc {} from gid {}\n",
+//                 b->gid, move_info.move_gid, move_info.src_proc, move_info.dst_proc, l->target(i).gid);
         }
     }
 }
@@ -157,112 +228,96 @@ void set_dynamic_assigner(diy::DynamicAssigner&   dynamic_assigner,
 // TODO: make this a member function of dynamic assigner
 void move_block(diy::DynamicAssigner&    assigner,
                diy::Master&             master,
-               int&                     move_gid,                       // input/output, updated at the dst proc
-               int&                     src_proc,                       // input/output, updated at the dst proc
-               int&                     dst_proc)                       // input/output, updated at the dst proc
+               int                     move_gid,
+               int                     src_proc,
+               int                     dst_proc)
 {
-    // communicate info about the block moving from src to dst proc
-    MoveInfo sent_move_info, recvd_move_info;                           // information about the block that is moving
-    int dest_gid = -1;                                                  // gid of block where to send the move_info
-    if (move_gid >= 0)
-    {
-        sent_move_info.move_gid     = move_gid;
-        sent_move_info.src_proc     = src_proc;
-        sent_move_info.dst_proc     = dst_proc;
-
-        // get gid of a block on the dest proc
-        // TODO: need a better, more efficient way, slow and not always reliable, sometimes fails to find the dest_gid
-        for (auto i = 0; i < assigner.nblocks(); i++)
-        {
-            if (assigner.rank(i) == dst_proc)
-            {
-                dest_gid = i;
-                break;
-            }
-        }
-        if (dest_gid < 0 || dest_gid >= assigner.nblocks())
-        {
-            fmt::print(stderr, "MoveBlock() error: dest_gid {} invalid.\n", dest_gid);
-            abort();
-        }
-    }
-    else
-    {
-        sent_move_info.move_gid     = -1;
-        sent_move_info.src_proc     = -1;
-        sent_move_info.dst_proc     = -1;
-    }
-
     // debug
-    if (master.communicator().rank() == sent_move_info.src_proc)
-    fmt::print(stderr, "proc {} moving block gid {} to proc {} dest_gid {}\n",
-            sent_move_info.src_proc, sent_move_info.move_gid, sent_move_info.dst_proc, dest_gid);
+    if (master.communicator().rank() == src_proc)
+        fmt::print(stderr, "move_block(): proc {} moving block gid {} to proc {}\n", src_proc, move_gid, dst_proc);
 
+    // update links of blocks that neighbor the moving block
+    MoveInfo move_info(move_gid, src_proc, dst_proc);                            // information about the block that is moving
     master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
-            { send_info(b, cp, sent_move_info, dest_gid); });
-    master.exchange(true);                  // true: remote exchange
+            { send_link_info(b, cp, move_info); });
+    master.exchange();
     master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
-            { recv_info(b, cp, recvd_move_info, master); });
-
-    // debug
-    if (master.communicator().rank() == recvd_move_info.dst_proc)
-    fmt::print(stderr, "proc {} getting block gid {} from proc {}\n",
-            recvd_move_info.dst_proc, recvd_move_info.move_gid, recvd_move_info.src_proc);
+            { recv_link_info(b, cp, master); });
 
     // move the block from src to dst proc
     void* send_b;
     Block* recv_b;
-    if (master.communicator().rank() == sent_move_info.src_proc)
+    if (master.communicator().rank() == src_proc)
     {
-        send_b = master.block(master.lid(sent_move_info.move_gid));
+        send_b = master.block(master.lid(move_gid));
         diy::MemoryBuffer bb;
         master.saver()(send_b, bb);
-        master.communicator().send(sent_move_info.dst_proc, 0, bb.buffer);
+        master.communicator().send(dst_proc, 0, bb.buffer);
     }
-    else if (master.communicator().rank() == recvd_move_info.dst_proc)
+    else if (master.communicator().rank() == dst_proc)
     {
         recv_b = static_cast<Block*>(master.creator()());
         diy::MemoryBuffer bb;
-        master.communicator().recv(recvd_move_info.src_proc, 0, bb.buffer);
+        master.communicator().recv(src_proc, 0, bb.buffer);
         recv_b->load(recv_b, bb);
     }
 
     // move the link for the moving block from src to dst proc and update master on src and dst proc
-    if (master.communicator().rank() == sent_move_info.src_proc)
+    if (master.communicator().rank() == src_proc)
     {
-        diy::Link* send_link = master.link(master.lid(sent_move_info.move_gid));
+        diy::Link* send_link = master.link(master.lid(move_gid));
         diy::MemoryBuffer bb;
         diy::LinkFactory::save(bb, send_link);
-        master.communicator().send(sent_move_info.dst_proc, 0, bb.buffer);
+        master.communicator().send(dst_proc, 0, bb.buffer);
 
         // remove the block from the master
-        Block* delete_block = static_cast<Block*>(master.get(master.lid(sent_move_info.move_gid)));
-        master.release(master.lid(sent_move_info.move_gid));
+        Block* delete_block = static_cast<Block*>(master.get(master.lid(move_gid)));
+        master.release(master.lid(move_gid));
         delete delete_block;
     }
-    else if (master.communicator().rank() == recvd_move_info.dst_proc)
+    else if (master.communicator().rank() == dst_proc)
     {
         diy::MemoryBuffer bb;
         diy::Link* recv_link;
-        master.communicator().recv(recvd_move_info.src_proc, 0, bb.buffer);
+        master.communicator().recv(src_proc, 0, bb.buffer);
         recv_link = diy::LinkFactory::load(bb);
 
         // add block to the master
-        master.add(recvd_move_info.move_gid, recv_b, recv_link);
-
-        // update return arguments
-        move_gid = recvd_move_info.move_gid;
-        src_proc = recvd_move_info.src_proc;
-        dst_proc = recvd_move_info.dst_proc;
+        master.add(move_gid, recv_b, recv_link);
     }
+
+    // TODO: update the dynamic assigner
 }
 
 int main(int argc, char* argv[])
 {
     diy::mpi::environment     env(argc, argv);                          // diy equivalent of MPI_Init
     diy::mpi::communicator    world;                                    // diy equivalent of MPI communicator
-    int bpr = 8;                                                        // blocks per rank
+    int                       bpr = 4;                                  // blocks per rank
     int                       nblocks = world.size() * bpr;             // total number of blocks in global domain
+    int                       iters = 1;                                // number of iterations to run
+    int                       max_time = 1;                             // maximum time to compute a block (sec.)
+    bool                      help;
+
+    using namespace opts;
+    Options ops;
+    ops
+        >> Option('h', "help",      help,           "show help")
+        >> Option('b', "bpr",       bpr,            "number of diy blocks per mpi rank")
+        >> Option('i', "iters",     iters,          "number of iterations")
+        >> Option('t', "max_time",  max_time,       "maximum time to compute a block (in seconds)")
+        ;
+
+    if (!ops.parse(argc,argv) || help)
+    {
+        if (world.rank() == 0)
+        {
+            std::cout << "Usage: " << argv[0] << " [OPTIONS]\n";
+            std::cout << "Tests work stealing\n";
+            std::cout << ops;
+        }
+        return 1;
+    }
 
     diy::ContiguousAssigner   static_assigner(world.size(), nblocks);
 
@@ -294,6 +349,8 @@ int main(int argc, char* argv[])
                              RGLink*    l   = new RGLink(link);
                              b->gid         = gid;
                              b->bounds      = bounds;
+                             std::srand(gid * std::time(0));
+                             b->work        = double(std::rand()) / RAND_MAX * WORK_MAX;
 
                              master.add(gid, b, l);
                          });
@@ -301,39 +358,44 @@ int main(int argc, char* argv[])
     // debug: display the decomposition
 //     master.foreach(&Block::show_block);
 
-    // assume the source proc knows which block it wants to send and where
-    // TODO: eventually a DIY algorithm will implement work stealing to determine the move information at the source proc
-    // the move information will be communicated to other procs; they are not assumed to have global knowledge about the movement
-    int move_gid = -1;                                                  // -1 indicates not a source of block movement
-    int src_proc = -1;
-    int dst_proc = -1;
-    if (world.rank() == 0)
-    {
-        move_gid     = bpr - 1;
-        src_proc     = 0;
-        dst_proc     = 1;
-    }
+    // a block that will move
+    int move_gid;
+    int src_proc;
+    int dst_proc;
 
     // copy static assigner to dynamic assigner
     diy::DynamicAssigner    dynamic_assigner(world, world.size(), nblocks);
     set_dynamic_assigner(dynamic_assigner, master);                       // TODO: make a version of DynamicAssigner ctor take master and do this
 
+    // this barrier is mandatory, do not remove
+    // dynamic assigner needs to be fully updated and sync'ed across all procs before proceeding
     world.barrier();
 
-    // move one block from src to dst proc
-    move_block(dynamic_assigner, master, move_gid, src_proc, dst_proc);  // TODO: make this a dynamic assigner member function
+    // iterate over the blocks
+    for (auto n = 0; n < iters; n++)
+    {
+        // some block computation
+        master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
+                { b->compute(cp, max_time, n); });
 
-    // debug: print the master of src and dst proc
-    if (world.rank() == src_proc)
-    {
-        fmt::print(stderr, "master size {}\n", master.size());
-        for (auto i = 0; i < master.size(); i++)
-            fmt::print(stderr, "lid {} gid {}\n", i, master.gid(i));
-    }
-    else if (world.rank() == dst_proc)
-    {
-        fmt::print(stderr, "master size {}\n", master.size());
-        for (auto i = 0; i < master.size(); i++)
-            fmt::print(stderr, "lid {} gid {}\n", i, master.gid(i));
+        // exchange info about work balance
+        exchange_work_info(master, move_gid, src_proc, dst_proc);
+
+        // move one block from src to dst proc
+        move_block(dynamic_assigner, master, move_gid, src_proc, dst_proc);  // TODO: make this a dynamic assigner member function
+
+        // debug: print the master of src and dst proc
+        if (world.rank() == src_proc)
+        {
+            fmt::print(stderr, "iteration {} master size {}\n", n, master.size());
+            for (auto i = 0; i < master.size(); i++)
+                fmt::print(stderr, "lid {} gid {}\n", i, master.gid(i));
+        }
+        else if (world.rank() == dst_proc)
+        {
+            fmt::print(stderr, "iteration {} master size {}\n", n, master.size());
+            for (auto i = 0; i < master.size(); i++)
+                fmt::print(stderr, "lid {} gid {}\n", i, master.gid(i));
+        }
     }
 }
