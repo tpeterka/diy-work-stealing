@@ -70,7 +70,7 @@ struct Block
         useconds_t usec = max_time * work * 10000;
 
         // debug
-        fmt::print(stderr, "itertion {} block gid {} computing for {} s.\n", iter, gid, double(usec) / 1e6);
+//         fmt::print(stderr, "iteration {} block gid {} computing for {} s.\n", iter, gid, double(usec) / 1e6);
 
         usleep(usec);
     }
@@ -89,7 +89,7 @@ void exchange_work_info(const   diy::Master& master,
                         int&    dst_proc)                               // (output) dst proc that will receive move_gid
 {
     WorkInfo                my_work_info = {master.communicator().rank(), -1, 0, 0};
-    std::vector<WorkInfo>   all_work_info;
+//     std::vector<WorkInfo>   all_work_info;
 
     // compile my work info
     for (auto i = 0; i < master.size(); i++)
@@ -107,7 +107,7 @@ void exchange_work_info(const   diy::Master& master,
 //     fmt::print(stderr, "exchange_work_info(): proc_rank {} top_gid {} top_work {} proc_work {}\n",
 //             my_work_info.proc_rank, my_work_info.top_gid, my_work_info.top_work, my_work_info.proc_work);
 
-    // vectors of integers from WorkInfo  TODO: how to all_gather WorkInfo directly
+    // vectors of integers from WorkInfo
     std::vector<int>                my_work_info_vec(4);
     std::vector<std::vector<int>>   all_work_info_vec;
     my_work_info_vec[0] = my_work_info.proc_rank;
@@ -117,9 +117,6 @@ void exchange_work_info(const   diy::Master& master,
 
     // exchange work info TODO: use something like down-up-down tree in IExchangeInfoCollective?
     diy::mpi::all_gather(master.communicator(), my_work_info_vec, all_work_info_vec);
-
-    // TODO: how to compile this:
-//     diy::mpi::all_gather(master.communicator(), my_work_info, all_work_info);
 
     // parse all_work_info to decide block migration, all procs arrive at the same decision
     // for now pick the proc with the max. total work and move its top_gid to the proc with the min. total work
@@ -174,8 +171,8 @@ void send_link_info(Block*                               b,                  // 
             cp.enqueue(l->target(i), move_info);
 
             // debug
-//             fmt::print(stderr, "send_info(): link info: gid {} enqueing move_gid {}, src_proc {} dst_proc {} to gid {}\n",
-//                 b->gid, move_info.move_gid, move_info.src_proc, move_info.dst_proc, l->target(i).gid);
+            fmt::print(stderr, "send_link_info(): link info: gid {} enqueing move_gid {}, src_proc {} dst_proc {} to target({}) = gid {} proc {}\n",
+                b->gid, move_info.move_gid, move_info.src_proc, move_info.dst_proc, i, l->target(i).gid, l->target(i).proc);
         }
     }
 }
@@ -213,7 +210,7 @@ void recv_link_info(Block*                               b,                  // 
 // set dynamic assigner blocks to local blocks of master
 // TODO: make a version of DynamicAssigner ctor take master as an arg and do this
 void set_dynamic_assigner(diy::DynamicAssigner&   dynamic_assigner,
-                        diy::Master&            master)
+                          diy::Master&            master)
 {
     std::vector<std::tuple<int, int>> rank_gids(master.size());
     int rank = master.communicator().rank();
@@ -226,21 +223,23 @@ void set_dynamic_assigner(diy::DynamicAssigner&   dynamic_assigner,
 
 // move one block from src to dst proc
 // TODO: make this a member function of dynamic assigner
-void move_block(diy::DynamicAssigner&    assigner,
-               diy::Master&             master,
-               int                     move_gid,
-               int                     src_proc,
-               int                     dst_proc)
+void move_block(diy::DynamicAssigner&   assigner,
+                diy::Master&            master,
+                int                     move_gid,
+                int                     src_proc,
+                int                     dst_proc)
 {
     // debug
     if (master.communicator().rank() == src_proc)
-        fmt::print(stderr, "move_block(): proc {} moving block gid {} to proc {}\n", src_proc, move_gid, dst_proc);
+        fmt::print(stderr, "move_block(): move_gid {} src_proc {} dst_proc {}\n", move_gid, src_proc, dst_proc);
 
     // update links of blocks that neighbor the moving block
     MoveInfo move_info(move_gid, src_proc, dst_proc);                            // information about the block that is moving
     master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
             { send_link_info(b, cp, move_info); });
+    fmt::print(stderr, "3:\n");
     master.exchange();
+    fmt::print(stderr, "4:\n");
     master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
             { recv_link_info(b, cp, master); });
 
@@ -286,7 +285,9 @@ void move_block(diy::DynamicAssigner&    assigner,
         master.add(move_gid, recv_b, recv_link);
     }
 
-    // TODO: update the dynamic assigner
+    // update the dynamic assigner
+    if (master.communicator().rank() == src_proc)
+        assigner.set_rank(dst_proc, move_gid, true);
 }
 
 int main(int argc, char* argv[])
@@ -294,7 +295,6 @@ int main(int argc, char* argv[])
     diy::mpi::environment     env(argc, argv);                          // diy equivalent of MPI_Init
     diy::mpi::communicator    world;                                    // diy equivalent of MPI communicator
     int                       bpr = 4;                                  // blocks per rank
-    int                       nblocks = world.size() * bpr;             // total number of blocks in global domain
     int                       iters = 1;                                // number of iterations to run
     int                       max_time = 1;                             // maximum time to compute a block (sec.)
     bool                      help;
@@ -319,6 +319,7 @@ int main(int argc, char* argv[])
         return 1;
     }
 
+    int                       nblocks = world.size() * bpr;             // total number of blocks in global domain
     diy::ContiguousAssigner   static_assigner(world.size(), nblocks);
 
     Bounds domain(3);                                                   // global data size
@@ -371,6 +372,17 @@ int main(int argc, char* argv[])
     // dynamic assigner needs to be fully updated and sync'ed across all procs before proceeding
     world.barrier();
 
+    // debug: print the link for each block
+//     for (auto i = 0; i < master.size(); i++)
+//     {
+//         Block*      b    = static_cast<Block*>(master.block(i));
+//         diy::Link*  link = master.link(i);
+//         fmt::print(stderr, "Link for block gid {} has size {}:\n", b->gid, link->size());
+//         for (auto i = 0; i < link->size(); i++)
+//             fmt::print(stderr, "[gid, proc] = [{}, {}] ", link->target(i).gid, link->target(i).proc);
+//         fmt::print(stderr, "\n");
+//     }
+
     // iterate over the blocks
     for (auto n = 0; n < iters; n++)
     {
@@ -381,8 +393,12 @@ int main(int argc, char* argv[])
         // exchange info about work balance
         exchange_work_info(master, move_gid, src_proc, dst_proc);
 
+        fmt::print(stderr, "1: n {}\n", n);
+
         // move one block from src to dst proc
         move_block(dynamic_assigner, master, move_gid, src_proc, dst_proc);  // TODO: make this a dynamic assigner member function
+
+        fmt::print(stderr, "2: n {}\n", n);
 
         // debug: print the master of src and dst proc
         if (world.rank() == src_proc)
@@ -397,5 +413,16 @@ int main(int argc, char* argv[])
             for (auto i = 0; i < master.size(); i++)
                 fmt::print(stderr, "lid {} gid {}\n", i, master.gid(i));
         }
+
+        // debug: print the link for each block
+//         for (auto i = 0; i < master.size(); i++)
+//         {
+//             Block*      b    = static_cast<Block*>(master.block(i));
+//             diy::Link*  link = master.link(i);
+//             fmt::print(stderr, "Link for block gid {} has size {}:\n", b->gid, link->size());
+//             for (auto i = 0; i < link->size(); i++)
+//                 fmt::print(stderr, "[gid, proc] = [{}, {}] ", link->target(i).gid, link->target(i).proc);
+//             fmt::print(stderr, "\n");
+//         }
     }
 }
