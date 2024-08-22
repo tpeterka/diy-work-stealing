@@ -6,7 +6,7 @@ spack env deactivate > /dev/null 2>&1
 spack env activate $SPACKENV
 echo "activated spack environment $SPACKENV"
 
-echo "setting flags for building moab-example"
+echo "setting flags for building diy-work-stealing"
 export DIY_PATH=`spack location -i diy`
 export FMT_PATH=`spack location -i fmt`
 

@@ -20,6 +20,7 @@ struct WorkInfo
     int top_gid;            // gid of most expensive block in this process TODO: can be top-k-gids, as long as k is fixed and known by all
     int top_work;           // work of top_gid TODO: can be vector of top-k work, as long as k is fixed and known by all
     int proc_work;          // total work of this process
+    int nlids;              // local number of blocks in this process
 };
 
 // information about a block that is moving
@@ -83,13 +84,13 @@ struct Block
 };
 
 // exchange work information among all processes
-void exchange_work_info(const   diy::Master& master,
+// returns true: move the block, false: nothing to move
+bool exchange_work_info(const   diy::Master& master,
                         int&    move_gid,                               // (output) block that will migrate
                         int&    src_proc,                               // (output) src proc that will send move_gid
                         int&    dst_proc)                               // (output) dst proc that will receive move_gid
 {
-    WorkInfo                my_work_info = {master.communicator().rank(), -1, 0, 0};
-//     std::vector<WorkInfo>   all_work_info;
+    WorkInfo                my_work_info = {master.communicator().rank(), -1, 0, 0, (int)(master.size())};
 
     // compile my work info
     for (auto i = 0; i < master.size(); i++)
@@ -104,25 +105,28 @@ void exchange_work_info(const   diy::Master& master,
     }
 
     // debug
-//     fmt::print(stderr, "exchange_work_info(): proc_rank {} top_gid {} top_work {} proc_work {}\n",
-//             my_work_info.proc_rank, my_work_info.top_gid, my_work_info.top_work, my_work_info.proc_work);
+//     fmt::print(stderr, "exchange_work_info(): proc_rank {} top_gid {} top_work {} proc_work {} nlids {}\n",
+//             my_work_info.proc_rank, my_work_info.top_gid, my_work_info.top_work, my_work_info.proc_work, my_work_info.nlids);
 
     // vectors of integers from WorkInfo
-    std::vector<int>                my_work_info_vec(4);
+    std::vector<int> my_work_info_vec =
+    {
+        my_work_info.proc_rank,
+        my_work_info.top_gid,
+        my_work_info.top_work,
+        my_work_info.proc_work,
+        my_work_info.nlids
+    };
     std::vector<std::vector<int>>   all_work_info_vec;
-    my_work_info_vec[0] = my_work_info.proc_rank;
-    my_work_info_vec[1] = my_work_info.top_gid;
-    my_work_info_vec[2] = my_work_info.top_work;
-    my_work_info_vec[3] = my_work_info.proc_work;
 
-    // exchange work info TODO: use something like down-up-down tree in IExchangeInfoCollective?
+    // exchange work info TODO: use something like distributed consensus protocol in iexchange?
     diy::mpi::all_gather(master.communicator(), my_work_info_vec, all_work_info_vec);
 
-    // parse all_work_info to decide block migration, all procs arrive at the same decision
+    // parse all_work_info to decide block migration, all procs arriving at the same decision
     // for now pick the proc with the max. total work and move its top_gid to the proc with the min. total work
     // TODO later we can be more sophisticated, e.g., cut the work difference in half, or make this decision a callback function defined by the user
-    WorkInfo max_work = {-1, -1, 0, 0};
-    WorkInfo min_work = {-1, -1, 0, 0};
+    WorkInfo max_work = {-1, -1, 0, 0, 0};
+    WorkInfo min_work = {-1, -1, 0, 0, 0};
     WorkInfo work_info;
     for (auto i = 0; i < master.communicator().size(); i++)             // for all process ranks
     {
@@ -130,6 +134,7 @@ void exchange_work_info(const   diy::Master& master,
         work_info.top_gid   = all_work_info_vec[i][1];
         work_info.top_work  = all_work_info_vec[i][2];
         work_info.proc_work = all_work_info_vec[i][3];
+        work_info.nlids     = all_work_info_vec[i][4];
 
         if (max_work.proc_rank == -1 || work_info.proc_work > max_work.proc_work)
         {
@@ -137,6 +142,7 @@ void exchange_work_info(const   diy::Master& master,
             max_work.top_gid    = work_info.top_gid;
             max_work.top_work   = work_info.top_work;
             max_work.proc_work  = work_info.proc_work;
+            max_work.nlids      = work_info.nlids;
         }
         if (min_work.proc_rank == -1 || work_info.proc_work < min_work.proc_work)
         {
@@ -144,17 +150,25 @@ void exchange_work_info(const   diy::Master& master,
             min_work.top_gid    = work_info.top_gid;
             min_work.top_work   = work_info.top_work;
             min_work.proc_work  = work_info.proc_work;
+            min_work.nlids      = work_info.nlids;
         }
     }
 
-    move_gid    = max_work.top_gid;
-    src_proc    = max_work.proc_rank;
-    dst_proc    = min_work.proc_rank;
+    // src and dst procs need to differ, and don't leave a proc with no blocks
+    if (max_work.proc_rank != min_work.proc_rank && max_work.nlids > 1)
+    {
+        move_gid    = max_work.top_gid;
+        src_proc    = max_work.proc_rank;
+        dst_proc    = min_work.proc_rank;
+        return true;
+    }
+    else
+        return false;
 
     // debug
-    if (master.communicator().rank() == src_proc)
-        fmt::print(stderr, "exchange_work_info(): move_gid {} src_proc {} dst_proc {}\n",
-                move_gid, src_proc, dst_proc);
+//     if (master.communicator().rank() == src_proc)
+//         fmt::print(stderr, "exchange_work_info(): move_gid {} src_proc {} dst_proc {}\n",
+//                 move_gid, src_proc, dst_proc);
 }
 
 // callback for synchronous exchange, sending link info
@@ -171,8 +185,8 @@ void send_link_info(Block*                               b,                  // 
             cp.enqueue(l->target(i), move_info);
 
             // debug
-            fmt::print(stderr, "send_link_info(): link info: gid {} enqueing move_gid {}, src_proc {} dst_proc {} to target({}) = gid {} proc {}\n",
-                b->gid, move_info.move_gid, move_info.src_proc, move_info.dst_proc, i, l->target(i).gid, l->target(i).proc);
+//             fmt::print(stderr, "send_link_info(): link info: gid {} enqueing move_gid {}, src_proc {} dst_proc {} to target({}) = gid {} proc {}\n",
+//                 b->gid, move_info.move_gid, move_info.src_proc, move_info.dst_proc, i, l->target(i).gid, l->target(i).proc);
         }
     }
 }
@@ -223,23 +237,21 @@ void set_dynamic_assigner(diy::DynamicAssigner&   dynamic_assigner,
 
 // move one block from src to dst proc
 // TODO: make this a member function of dynamic assigner
-void move_block(diy::DynamicAssigner&   assigner,
+void  move_block(diy::DynamicAssigner&   assigner,
                 diy::Master&            master,
                 int                     move_gid,
                 int                     src_proc,
                 int                     dst_proc)
 {
     // debug
-    if (master.communicator().rank() == src_proc)
-        fmt::print(stderr, "move_block(): move_gid {} src_proc {} dst_proc {}\n", move_gid, src_proc, dst_proc);
+//     if (master.communicator().rank() == src_proc)
+//         fmt::print(stderr, "move_block(): move_gid {} src_proc {} dst_proc {}\n", move_gid, src_proc, dst_proc);
 
     // update links of blocks that neighbor the moving block
     MoveInfo move_info(move_gid, src_proc, dst_proc);                            // information about the block that is moving
     master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
             { send_link_info(b, cp, move_info); });
-    fmt::print(stderr, "3:\n");
     master.exchange();
-    fmt::print(stderr, "4:\n");
     master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
             { recv_link_info(b, cp, master); });
 
@@ -350,14 +362,15 @@ int main(int argc, char* argv[])
                              RGLink*    l   = new RGLink(link);
                              b->gid         = gid;
                              b->bounds      = bounds;
-                             std::srand(gid * std::time(0));
+//                              std::srand(gid * std::time(0));
+                             std::srand(gid + 1);
                              b->work        = double(std::rand()) / RAND_MAX * WORK_MAX;
 
                              master.add(gid, b, l);
                          });
 
     // debug: display the decomposition
-//     master.foreach(&Block::show_block);
+    master.foreach(&Block::show_block);
 
     // a block that will move
     int move_gid;
@@ -391,28 +404,22 @@ int main(int argc, char* argv[])
                 { b->compute(cp, max_time, n); });
 
         // exchange info about work balance
-        exchange_work_info(master, move_gid, src_proc, dst_proc);
-
-        fmt::print(stderr, "1: n {}\n", n);
+        if (!exchange_work_info(master, move_gid, src_proc, dst_proc))
+            continue;
 
         // move one block from src to dst proc
         move_block(dynamic_assigner, master, move_gid, src_proc, dst_proc);  // TODO: make this a dynamic assigner member function
 
-        fmt::print(stderr, "2: n {}\n", n);
-
         // debug: print the master of src and dst proc
         if (world.rank() == src_proc)
-        {
-            fmt::print(stderr, "iteration {} master size {}\n", n, master.size());
+            fmt::print(stderr, "iteration {}: after moving gid {} from src rank {} to dst rank {}, src master size {}\n",
+                    n, move_gid, src_proc, dst_proc, master.size());
+        if (world.rank() == dst_proc)
+            fmt::print(stderr, "iteration {}: after moving gid {} from src rank {} to dst rank {}, dst master size {}\n",
+                    n, move_gid, src_proc, dst_proc, master.size());
+        if (world.rank() == src_proc || world.rank() == dst_proc)
             for (auto i = 0; i < master.size(); i++)
                 fmt::print(stderr, "lid {} gid {}\n", i, master.gid(i));
-        }
-        else if (world.rank() == dst_proc)
-        {
-            fmt::print(stderr, "iteration {} master size {}\n", n, master.size());
-            for (auto i = 0; i < master.size(); i++)
-                fmt::print(stderr, "lid {} gid {}\n", i, master.gid(i));
-        }
 
         // debug: print the link for each block
 //         for (auto i = 0; i < master.size(); i++)

@@ -14,9 +14,9 @@ echo "activating spack environment"
 spack env activate $SPACKENV
 
 # following is for optional debugging; comment out if not needed
-spack add gdb
-spack add cgdb
-spack add tmux
+# spack add gdb
+# spack add cgdb
+# spack add tmux
 
 # install everything in environment
 echo "installing dependencies in environment"
