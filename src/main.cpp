@@ -68,7 +68,7 @@ struct Block
                  int                                max_time,               // maximum time for a block to compute
                  int                                iter)                   // curent iteration
     {
-        useconds_t usec = max_time * work * 10000;
+        unsigned int usec = max_time * work * 10000L;
 
         // debug
 //         fmt::print(stderr, "iteration {} block gid {} computing for {} s.\n", iter, gid, double(usec) / 1e6);
@@ -265,6 +265,10 @@ void  move_block(diy::DynamicAssigner&   assigner,
     master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
             { recv_link_info(b, cp, master); });
 
+    // TP: this barrier is needed on my laptop at 8 ranks, otherwise moving the block below hangs
+    // TODO: decide whether it's needed on a production machine
+    master.communicator().barrier();
+
     // move the block from src to dst proc
     void* send_b;
     Block* recv_b;
@@ -383,9 +387,9 @@ int main(int argc, char* argv[])
                          });
 
     // debug: display the decomposition
-    master.foreach(&Block::show_block);
+//     master.foreach(&Block::show_block);
 
-    world.barrier();
+    world.barrier();                                                    // barrier to synchronize clocks across procs, do not remove
     wall_time = MPI_Wtime();
 
     // copy static assigner to dynamic assigner
@@ -425,21 +429,32 @@ int main(int argc, char* argv[])
 
         // decide what to move where
         if (!decide_move_info(master, all_work_info, move_info))
+        {
+            // debug
+            if (world.rank() == 0)
+                fmt::print(stderr, "iteration {}: nothing to move\n", n);
+
             continue;
+        }
+
+        // debug
+        if (world.rank() == 0)
+            fmt::print(stderr, "iteration {}: moving gid {} from src rank {} to dst rank {}\n",
+                    n, move_info.move_gid, move_info.src_proc, move_info.dst_proc);
 
         // move one block from src to dst proc
         move_block(dynamic_assigner, master, move_info);  // TODO: make this a dynamic assigner member function
 
         // debug: print the master of src and dst proc
-        if (world.rank() == move_info.src_proc)
-            fmt::print(stderr, "iteration {}: after moving gid {} from src rank {} to dst rank {}, src master size {}\n",
-                    n, move_info.move_gid, move_info.src_proc, move_info.dst_proc, master.size());
-        if (world.rank() == move_info.dst_proc)
-            fmt::print(stderr, "iteration {}: after moving gid {} from src rank {} to dst rank {}, dst master size {}\n",
-                    n, move_info.move_gid, move_info.src_proc, move_info.dst_proc, master.size());
-        if (world.rank() == move_info.src_proc || world.rank() == move_info.dst_proc)
-            for (auto i = 0; i < master.size(); i++)
-                fmt::print(stderr, "lid {} gid {}\n", i, master.gid(i));
+//         if (world.rank() == move_info.src_proc)
+//             fmt::print(stderr, "iteration {}: after moving gid {} from src rank {} to dst rank {}, src master size {}\n",
+//                     n, move_info.move_gid, move_info.src_proc, move_info.dst_proc, master.size());
+//         if (world.rank() == move_info.dst_proc)
+//             fmt::print(stderr, "iteration {}: after moving gid {} from src rank {} to dst rank {}, dst master size {}\n",
+//                     n, move_info.move_gid, move_info.src_proc, move_info.dst_proc, master.size());
+//         if (world.rank() == move_info.src_proc || world.rank() == move_info.dst_proc)
+//             for (auto i = 0; i < master.size(); i++)
+//                 fmt::print(stderr, "lid {} gid {}\n", i, master.gid(i));
 
         // debug: print the link for each block
 //         for (auto i = 0; i < master.size(); i++)
@@ -453,7 +468,7 @@ int main(int argc, char* argv[])
 //         }
     }
 
-    world.barrier();
+    world.barrier();                                    // barrier to synchronize clocks over procs, do not remove
     wall_time = MPI_Wtime() - wall_time;
     if (world.rank() == 0)
         fmt::print(stderr, "Total elapsed wall time {:.3} sec.\n", wall_time);
