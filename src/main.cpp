@@ -348,6 +348,8 @@ int main(int argc, char* argv[])
         return 1;
     }
 
+//     diy::create_logger("trace");
+
     int                       nblocks = world.size() * bpr;             // total number of blocks in global domain
     diy::ContiguousAssigner   static_assigner(world.size(), nblocks);
 
@@ -379,7 +381,6 @@ int main(int argc, char* argv[])
                              RGLink*    l   = new RGLink(link);
                              b->gid         = gid;
                              b->bounds      = bounds;
-//                              std::srand(gid * std::time(0));
                              std::srand(gid + 1);
                              b->work        = double(std::rand()) / RAND_MAX * WORK_MAX;
 

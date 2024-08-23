@@ -2,6 +2,7 @@ project                     (diy-work-stealing)
 cmake_minimum_required      (VERSION 3.12)
 
 option                      (wrapped_mpi    "MPI compiler wrapper requires no further MPI libs"     OFF)
+option                      (log            "Build DIY with logging"                                OFF)
 
 # C++11
 if                          (NOT DEFINED CMAKE_CXX_STANDARD)
@@ -42,6 +43,18 @@ else                        ()
 endif                       ()
 message                     ("DIY_INCLUDE_DIR = ${DIY_INCLUDE_DIR}")
 include_directories         (SYSTEM ${DIY_INCLUDE_DIR})
+
+# Debugging
+if                          (${CMAKE_BUILD_TYPE} STREQUAL "Debug" OR
+                             ${CMAKE_BUILD_TYPE} STREQUAL "RelWithDebInfo")
+    add_definitions         ("-DDEBUG")
+endif                       ()
+
+# Logging
+if                          (log)
+    add_definitions         ("-DDIY_USE_SPDLOG")
+    find_package            (spdlog REQUIRED)
+endif()
 
 # fmt
 if                          (NOT DEFINED FMT_PATH AND DEFINED ENV{FMT_PATH})
