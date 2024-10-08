@@ -13,6 +13,11 @@ spack env create $SPACKENV $YAML
 echo "activating spack environment"
 spack env activate $SPACKENV
 
+spack add mpich@4
+spack add diy
+spack add fmt
+spack add spdlog
+
 # following is for optional debugging; comment out if not needed
 # spack add gdb
 # spack add cgdb
