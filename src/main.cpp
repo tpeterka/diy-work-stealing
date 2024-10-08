@@ -262,6 +262,100 @@ void exchange_sample_work_info(const diy::Master&       master,
     }
 }
 
+// gather work information from all processes in order to collect summary stats
+void   gather_work_info(const diy::Master&      master,
+                        std::vector<Work>&      local_work,             // work for each local block TODO: eventually internal to master?
+                        std::vector<WorkInfo>&  all_work_info)          // (output) global work info
+{
+    auto nlids  = master.size();                    // my local number of blocks
+    auto nprocs = master.communicator().size();     // global number of procs
+
+    WorkInfo my_work_info = { master.communicator().rank(), -1, 0, 0, (int)nlids };
+
+    // compile my work info
+    for (auto i = 0; i < master.size(); i++)
+    {
+        Block* block = static_cast<Block*>(master.block(i));
+        my_work_info.proc_work += local_work[i];
+        if (my_work_info.top_gid == -1 || my_work_info.top_work < local_work[i])
+        {
+            my_work_info.top_gid    = master.gid(i);
+            my_work_info.top_work   = local_work[i];
+        }
+    }
+
+    // debug
+//     fmt::print(stderr, "exchange_work_info(): proc_rank {} top_gid {} top_work {} proc_work {} nlids {}\n",
+//             my_work_info.proc_rank, my_work_info.top_gid, my_work_info.top_work, my_work_info.proc_work, my_work_info.nlids);
+
+    // vectors of integers from WorkInfo
+    std::vector<int> my_work_info_vec =
+    {
+        my_work_info.proc_rank,
+        my_work_info.top_gid,
+        my_work_info.top_work,
+        my_work_info.proc_work,
+        my_work_info.nlids
+    };
+    std::vector<std::vector<int>>   all_work_info_vec;
+
+    // gather work info
+    diy::mpi::gather(master.communicator(), my_work_info_vec, all_work_info_vec, 0);
+
+    // unpack received info into vector of structs
+    if (master.communicator().rank() == 0)
+    {
+        all_work_info.resize(nprocs);
+        for (auto i = 0; i < nprocs; i++)
+        {
+            all_work_info[i].proc_rank = all_work_info_vec[i][0];
+            all_work_info[i].top_gid   = all_work_info_vec[i][1];
+            all_work_info[i].top_work  = all_work_info_vec[i][2];
+            all_work_info[i].proc_work = all_work_info_vec[i][3];
+            all_work_info[i].nlids     = all_work_info_vec[i][4];
+        }
+    }
+}
+
+// compute summary stats on work information from all processes
+void stats_work_info(const diy::Master&         master,
+                     std::vector<WorkInfo>&     all_work_info)
+{
+    Work tot_work = 0;
+    Work max_work = 0;
+    Work min_work = 0;
+    float avg_work;
+    float rel_imbalance;
+
+    for (auto i = 0; i < all_work_info.size(); i++)
+    {
+        if (i == 0 || all_work_info[i].proc_work < min_work)
+            min_work = all_work_info[i].proc_work;
+        if (i == 0 || all_work_info[i].proc_work > max_work)
+            max_work = all_work_info[i].proc_work;
+        tot_work += all_work_info[i].proc_work;
+    }
+
+    avg_work = tot_work / all_work_info.size();
+    rel_imbalance   = float(max_work - min_work) / max_work;
+
+    if (master.communicator().rank() == 0)
+    fmt::print(stderr, "Max process work {} Min process work {} Avg process work {} Rel process imbalance [(max - min) / max] {:.3}\n",
+            max_work, min_work, avg_work, rel_imbalance);
+}
+
+void summary_stats(const diy::Master& master)
+{
+    std::vector<WorkInfo>   all_work_info;
+    std::vector<Work> local_work(master.size());
+
+    for (auto i = 0; i < master.size(); i++)
+        local_work[i] = static_cast<Block*>(master.block(i))->work;
+
+    gather_work_info(master, local_work, all_work_info);
+    stats_work_info(master, all_work_info);
+}
+
 // determine move info from work info
 // the user writes this function for now, TODO: implement in diy
 void decide_move_info(const diy::Master&            master,
@@ -490,6 +584,11 @@ int main(int argc, char* argv[])
     std::vector<WorkInfo>   sample_work_info;
     MoveInfo                move_info;
 
+    // load balance summary stats
+    if (world.rank() == 0)
+        fmt::print(stderr, "Summary stats before beginning\n");
+    summary_stats(master);
+
     // perform some iterative algorithm
     for (auto n = 0; n < iters; n++)
     {
@@ -544,4 +643,9 @@ int main(int argc, char* argv[])
     wall_time = MPI_Wtime() - wall_time;
     if (world.rank() == 0)
         fmt::print(stderr, "Total elapsed wall time {:.3} sec.\n", wall_time);
+
+    // load balance summary stats
+    if (world.rank() == 0)
+        fmt::print(stderr, "Summary stats upon completion\n");
+    summary_stats(master);
 }
