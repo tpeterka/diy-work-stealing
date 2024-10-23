@@ -165,46 +165,21 @@ void exchange_work_info(const diy::Master&      master,
     }
 }
 
-// exchange work information among all processes using sampling
+// get work information from a random sample of processes
 // TODO: make a master member function
 void exchange_sample_work_info(const diy::Master&       master,
                                std::vector<Work>&       local_work,             // work for each local block TODO: eventually internal to master?
                                float                    sample_frac,            // fraction of procs to sample 0.0 < sample_size <= 1.0
                                int                      iter,                   // current iteration
-                               std::vector<WorkInfo>&   sample_work_info)       // (output) global work info for sample procs
+                               WorkInfo&                my_work_info,           // (output) my work info
+                               std::vector<WorkInfo>&   sample_work_info)       // (output) vector of sorted sample work info, sorted by increasing total work per process
 {
-    sample_work_info.clear();
     auto nlids  = master.size();                    // my local number of blocks
     auto nprocs = master.communicator().size();     // global number of procs
     auto my_proc = master.communicator().rank();    // rank of my proc
 
-    // pick a random sample of processes
-    int nsamples = sample_frac * nprocs;
-    std::set<int> sample_procs;
-    for (auto i = 0; i < nsamples; i++)
-    {
-        std::srand((iter + 1) * (i + 1));
-        int rand_proc;
-        do
-        {
-            rand_proc = double(std::rand()) / RAND_MAX * master.communicator().size();
-        } while (sample_procs.find(rand_proc) != sample_procs.end());
-        sample_procs.insert(rand_proc);
-    }
-
-    // check if my proc belongs to the sample
-    auto my_proc_iter = sample_procs.find(my_proc);
-    if (my_proc_iter == sample_procs.end())
-        return;
-
-    // debug
-//     fmt::print(stderr, "sample_procs [{}]\n", fmt::join(sample_procs, ","));
-
-    // my proc is one of the sample_procs
-
-    WorkInfo my_work_info = { master.communicator().rank(), -1, 0, 0, (int)nlids };
-
     // compile my work info
+    my_work_info = { master.communicator().rank(), -1, 0, 0, (int)nlids };
     for (auto i = 0; i < master.size(); i++)
     {
         Block* block = static_cast<Block*>(master.block(i));
@@ -217,8 +192,8 @@ void exchange_sample_work_info(const diy::Master&       master,
     }
 
     // debug
-//     fmt::print(stderr, "exchange_work_info(): proc_rank {} top_gid {} top_work {} proc_work {} nlids {}\n",
-//             my_work_info.proc_rank, my_work_info.top_gid, my_work_info.top_work, my_work_info.proc_work, my_work_info.nlids);
+    //     fmt::print(stderr, "exchange_work_info(): proc_rank {} top_gid {} top_work {} proc_work {} nlids {}\n",
+    //             my_work_info.proc_rank, my_work_info.top_gid, my_work_info.top_work, my_work_info.proc_work, my_work_info.nlids);
 
     // vectors of integers from WorkInfo
     std::vector<int> my_work_info_vec =
@@ -229,37 +204,333 @@ void exchange_sample_work_info(const diy::Master&       master,
         my_work_info.proc_work,
         my_work_info.nlids
     };
-    std::vector<int>   other_work_info_vec;
 
-    // exchange work info with other sample_procs
-    // TODO: interleave sends and recvs or loop over all sends followed by loop over all recvs?
-    sample_work_info.resize(nsamples);
+    // pick a random sample of processes, w/o duplicates, and excluding myself
+    int nsamples = sample_frac * nprocs;
+    std::set<int> sample_procs;
+    for (auto i = 0; i < nsamples; i++)
+    {
+        std::srand((iter + 1) * (i + 1) * (my_proc + 1));
+        int rand_proc;
+        do
+        {
+            rand_proc = double(std::rand()) / RAND_MAX * master.communicator().size();
+        } while (sample_procs.find(rand_proc) != sample_procs.end() || rand_proc == my_proc);
+        sample_procs.insert(rand_proc);
+    }
+
+    // debug
+//     fmt::print(stderr, "sample_procs [{}]\n", fmt::join(sample_procs, ","));
+
+    // communication protocol based on diy's rexchange, which is based on NBX algorithm of Hoefler et al.,
+    // Scalable Communication Protocols for Dynamic Sparse Data Exchange, 2010.
+
+    // send requests for work info to sample_procs using tag 0
+    std::vector<diy::mpi::request> reqs(sample_procs.size());
+    int a = 1;                      // simple integer to request work info
     int i = 0;
     for (auto proc_iter = sample_procs.begin(); proc_iter != sample_procs.end(); proc_iter++)
     {
-        if (proc_iter == my_proc_iter)
-        {
-            sample_work_info[i].proc_rank = my_work_info.proc_rank;
-            sample_work_info[i].top_gid   = my_work_info.top_gid;
-            sample_work_info[i].top_work  = my_work_info.top_work;
-            sample_work_info[i].proc_work = my_work_info.proc_work;
-            sample_work_info[i].nlids     = my_work_info.nlids;
-            i++;
-            continue;
-        }
-
-        // the following can deadlock if buffer space for sends is unavailable (unlikely but possible)
-        // TODO: either use sendrecv (not implemented in diy:mpi) or isend/recv
-        master.communicator().send(*proc_iter, 0, my_work_info_vec);
-        master.communicator().recv(*proc_iter, 0, other_work_info_vec);
-
-        sample_work_info[i].proc_rank = other_work_info_vec[0];
-        sample_work_info[i].top_gid   = other_work_info_vec[1];
-        sample_work_info[i].top_work  = other_work_info_vec[2];
-        sample_work_info[i].proc_work = other_work_info_vec[3];
-        sample_work_info[i].nlids     = other_work_info_vec[4];
+        reqs[i] = master.communicator().issend(*proc_iter, 0, a);
         i++;
     }
+
+    // receive requets for work info using tag 0
+    bool done = false;
+    bool barrier_active = false;
+    diy::mpi::request barrier_req;
+    std::vector<int> req_procs;     // requests for work info received from these processes
+    diy::mpi::optional<diy::mpi::status> status;
+    while (!done)
+    {
+        // nudge mpi's progress engine
+        for (auto i = 0; i < sample_procs.size(); i++)
+            reqs[i].test();
+
+        status = master.communicator().iprobe(diy::mpi::any_source, 0);
+        while (status)
+        {
+            int req;
+            master.communicator().recv(status->source(), 0, req);
+            req_procs.push_back(status->source());
+
+            // check for more requests
+            status = master.communicator().iprobe(diy::mpi::any_source, 0);
+        }
+
+        // synchronize
+        if (barrier_active)
+        {
+            if (barrier_req.test())
+                done = true;
+        }
+        else
+        {
+            barrier_req = master.communicator().ibarrier();
+            barrier_active = true;
+        }
+    }
+
+    // sanity check: wait for all requests to finish TODO: necessary?
+//     for (auto i = 0; i < reqs.size(); i++)
+//         reqs[i].wait();
+//     barrier_req.wait();
+
+    // send work info using tag 1
+    std::vector<diy::mpi::request> reqs1;
+    for (auto i = 0; i < req_procs.size(); i++)
+        reqs1.push_back(master.communicator().issend(req_procs[i], 1, my_work_info_vec));
+
+    // receive work info using tag 1
+    std::vector<int>   other_work_info_vec(5);
+    sample_work_info.resize(nsamples);
+    i = 0;
+    done = false;
+    barrier_active = false;
+    while (!done)
+    {
+        // nudge mpi's progress engine
+        for (auto i = 0; i < reqs1.size(); i++)
+            reqs1[i].test();
+
+        status = master.communicator().iprobe(diy::mpi::any_source, 1);
+        while (status)
+        {
+            master.communicator().recv(status->source(), 1, other_work_info_vec);
+
+            sample_work_info[i].proc_rank = other_work_info_vec[0];
+            sample_work_info[i].top_gid   = other_work_info_vec[1];
+            sample_work_info[i].top_work  = other_work_info_vec[2];
+            sample_work_info[i].proc_work = other_work_info_vec[3];
+            sample_work_info[i].nlids     = other_work_info_vec[4];
+            i++;
+
+            // check for more requests
+            status = master.communicator().iprobe(diy::mpi::any_source, 1);
+        }
+
+        // synchronize
+        if (barrier_active)
+        {
+            if (barrier_req.test())
+                done = true;
+        }
+        else
+        {
+            barrier_req = master.communicator().ibarrier();
+            barrier_active = true;
+        }
+    }
+
+    // sanity check: wait for all send requests to finish TODO: necessary?
+//     for (auto i = 0; i < reqs1.size(); i++)
+//         reqs1[i].wait();
+//     barrier_req.wait();
+
+    // sort sample_work_info by proc_work
+    struct
+    {
+        bool operator()(WorkInfo& a, WorkInfo& b) const { return a.proc_work < b.proc_work; }
+    }
+    CompareProcWork;
+    std::sort(sample_work_info.begin(), sample_work_info.end(), CompareProcWork);
+
+    // debug
+//     for (auto i = 0; i < sample_work_info.size(); i++)
+//         fmt::print(stderr, "sample_work_info[{}]: proc_rank {} top_gid {} top_work {} proc_work {} nlids {}\n",
+//                 i, sample_work_info[i].proc_rank, sample_work_info[i].top_gid, sample_work_info[i].top_work, sample_work_info[i].proc_work, sample_work_info[i].nlids);
+}
+
+// determine move info from work info
+// the user writes this function for now, TODO: implement in diy
+void decide_move_info(const diy::Master&            master,
+                      const std::vector<WorkInfo>&  all_work_info,          // global work info
+                      MoveInfo&                     move_info)              // (output) move info
+{
+    // initialize move_info
+    move_info = {-1, -1, -1};
+
+//     fmt::print(stderr, "decide_move_info: move_info.move_gid {} move_info.src_proc {} move_info.dst_proc {}\n",
+//             move_info.move_gid, move_info.src_proc, move_info.dst_proc);
+
+    // if my proc is not included in the global work info, nothing to do
+    if (!all_work_info.size())
+        return;
+
+    // parse all_work_info to decide block migration, all procs arriving at the same decision
+    // for now pick the proc with the max. total work and move its top_gid to the proc with the min. total work
+    // TODO later we can be more sophisticated, e.g., cut the work difference in half, etc., see related literature for guidance
+    WorkInfo max_work = {-1, -1, 0, 0, 0};
+    WorkInfo min_work = {-1, -1, 0, 0, 0};
+
+    for (auto i = 0; i < all_work_info.size(); i++)                         // for all process ranks being considered (entire world or a sample)
+    {
+        // debug
+//         fmt::print(stderr, "all_work_info[{}]: [{} {} {} {} {}]\n",
+//             i, all_work_info[i].proc_rank, all_work_info[i].top_gid, all_work_info[i].top_work, all_work_info[i].proc_work, all_work_info[i].nlids);
+
+        if (max_work.proc_rank == -1 || all_work_info[i].proc_work > max_work.proc_work)
+        {
+            max_work.proc_rank  = all_work_info[i].proc_rank;
+            max_work.top_gid    = all_work_info[i].top_gid;
+            max_work.top_work   = all_work_info[i].top_work;
+            max_work.proc_work  = all_work_info[i].proc_work;
+            max_work.nlids      = all_work_info[i].nlids;
+        }
+        if (min_work.proc_rank == -1 || all_work_info[i].proc_work < min_work.proc_work)
+        {
+            min_work.proc_rank  = all_work_info[i].proc_rank;
+            min_work.top_gid    = all_work_info[i].top_gid;
+            min_work.top_work   = all_work_info[i].top_work;
+            min_work.proc_work  = all_work_info[i].proc_work;
+            min_work.nlids      = all_work_info[i].nlids;
+        }
+    }
+
+    // src and dst procs need to differ, and don't leave a proc with no blocks
+    if (max_work.proc_rank != min_work.proc_rank && max_work.nlids > 1)
+    {
+        move_info.move_gid    = max_work.top_gid;
+        move_info.src_proc    = max_work.proc_rank;
+        move_info.dst_proc    = min_work.proc_rank;
+
+        // debug
+//         fmt::print(stderr, "decide_move_info(): move_gid {} src_proc {} dst_proc {}\n",
+//                 move_info.move_gid, move_info.src_proc, move_info.dst_proc);
+    }
+    else
+    {
+        fmt::print(stderr, "decide_move_info(): nothing to move max_work.proc_rank {} min_work.proc_rank {} max_work.nlids {}\n",
+                max_work.proc_rank, min_work.proc_rank, max_work.nlids);
+    }
+
+    return;
+}
+
+// determine move info from sampled work info
+// the user writes this function for now, TODO: implement in diy
+void decide_sample_move_info(const diy::Master&              master,
+                             const std::vector<WorkInfo>&    sample_work_info,           // sampled work info
+                             const WorkInfo&                 my_work_info,               // my work info
+                             std::vector<MoveInfo>&          multi_move_info)            // (output) move info
+{
+    // initialize move_info, multi_move_info
+    MoveInfo move_info = {-1, -1, -1};
+    multi_move_info.clear();
+
+    // pick a cutoff quantile above which to move blocks, see if my rank qualifies
+    float quantile = 0.8;                                                               // TODO: tune this, or make a user parameter
+    int my_work_idx = sample_work_info.size();                                          // index where my work would be in the sample_work
+    for (auto i = 0; i < sample_work_info.size(); i++)
+    {
+        if (my_work_info.proc_work < sample_work_info[i].proc_work)
+        {
+            my_work_idx = i;
+            break;
+        }
+    }
+
+    // debug
+//     fmt::print(stderr, "decide_sample_move_info(): my_work {} my_work_idx {}\n",
+//             my_work_info.proc_work, my_work_idx);
+
+    // communication protocol based on diy's rexchange, which is based on NBX algorithm of Hoefler et al.,
+    // Scalable Communication Protocols for Dynamic Sparse Data Exchange, 2010.
+
+    // my mpi process is either a donor of work or a potentially a recipient, but not both
+
+    // donor
+    if (my_work_idx >= quantile * sample_work_info.size())
+    {
+
+        // pick the destination process to be the mirror image of my work location in the samples
+        // ie, the heavier my process, the lighter the destination process
+        int target = sample_work_info.size() - my_work_idx;
+
+        // don't run out of blocks
+        if (my_work_info.nlids > 1)
+        {
+            move_info.move_gid = my_work_info.top_gid;
+            move_info.src_proc = my_work_info.proc_rank;
+            move_info.dst_proc = sample_work_info[target].proc_rank;
+            multi_move_info.push_back(move_info);
+
+            // debug
+//             fmt::print(stderr, "decide_sample_move_info(): my_work {} move_gid {} src_proc {} dst_proc {}\n",
+//                     my_work_info.proc_work, move_info.move_gid, move_info.src_proc, move_info.dst_proc);
+        }
+
+        // send move_info to destination proc using tag 2
+        std::vector<int> move_info_vec =
+        {
+            move_info.move_gid,
+            move_info.src_proc,
+            move_info.dst_proc
+        };
+        diy::mpi::request request, barrier_req;
+        request = master.communicator().issend(move_info.dst_proc, 2, move_info_vec);
+        request.test();                 // nudge mpi's progress engine
+        barrier_req = master.communicator().ibarrier();
+
+        // sanity check: wait for send request to finish TODO: necessary?
+//         request.wait();
+//         barrier_req.wait();
+
+        // debug
+//         fmt::print(stderr, "sending move info to proc {}\n", move_info.dst_proc);
+    }
+
+    // potential recipient
+    else
+    {
+        // check for move_info messages using tag 2
+        bool done = false;
+        bool barrier_active = false;
+        diy::mpi::request barrier_req;
+        diy::mpi::optional<diy::mpi::status> status;
+        std::vector<int> move_info_vec(3);
+
+        while (!done)
+        {
+            status = master.communicator().iprobe(diy::mpi::any_source, 2);
+            while (status)
+            {
+                master.communicator().recv(status->source(), 2, move_info_vec);
+                move_info.move_gid = move_info_vec[0];
+                move_info.src_proc = move_info_vec[1];
+                move_info.dst_proc = move_info_vec[2];
+                multi_move_info.push_back(move_info);
+
+                // debug
+//                 fmt::print(stderr, "recvd move info from proc {}: move_gid {} src_proc {} dst_proc {}\n",
+//                     status->source(), move_info.move_gid, move_info.src_proc, move_info.dst_proc);
+
+                // check for more requests
+                status = master.communicator().iprobe(diy::mpi::any_source, 2);
+            }
+
+            // synchronize
+            if (barrier_active)
+            {
+                if (barrier_req.test())
+                    done = true;
+            }
+            else
+            {
+                barrier_req = master.communicator().ibarrier();
+                barrier_active = true;
+            }
+        }
+
+        // initialize to -1's if no move_info messages were received
+        if (!multi_move_info.size())
+            multi_move_info.push_back(move_info);
+
+        // sanity check, wait for all requests to finish TODO: necessary?
+//         barrier_req.wait();
+    }
+
+    return;
 }
 
 // gather work information from all processes in order to collect summary stats
@@ -356,72 +627,6 @@ void summary_stats(const diy::Master& master)
     stats_work_info(master, all_work_info);
 }
 
-// determine move info from work info
-// the user writes this function for now, TODO: implement in diy
-void decide_move_info(const diy::Master&            master,
-                      const std::vector<WorkInfo>&  all_work_info,          // global work info
-                      MoveInfo&                     move_info)              // (output) move info
-{
-    // initialize move_info
-    move_info = {-1, -1, -1};
-
-//     fmt::print(stderr, "decide_move_info: move_info.move_gid {} move_info.src_proc {} move_info.dst_proc {}\n",
-//             move_info.move_gid, move_info.src_proc, move_info.dst_proc);
-
-    // if my proc is not included in the global work info, nothing to do
-    if (!all_work_info.size())
-        return;
-
-    // parse all_work_info to decide block migration, all procs arriving at the same decision
-    // for now pick the proc with the max. total work and move its top_gid to the proc with the min. total work
-    // TODO later we can be more sophisticated, e.g., cut the work difference in half, etc., see related literature for guidance
-    WorkInfo max_work = {-1, -1, 0, 0, 0};
-    WorkInfo min_work = {-1, -1, 0, 0, 0};
-
-    for (auto i = 0; i < all_work_info.size(); i++)                         // for all process ranks being considered (entire world or a sample)
-    {
-        // debug
-//         fmt::print(stderr, "all_work_info[{}]: [{} {} {} {} {}]\n",
-//             i, all_work_info[i].proc_rank, all_work_info[i].top_gid, all_work_info[i].top_work, all_work_info[i].proc_work, all_work_info[i].nlids);
-
-        if (max_work.proc_rank == -1 || all_work_info[i].proc_work > max_work.proc_work)
-        {
-            max_work.proc_rank  = all_work_info[i].proc_rank;
-            max_work.top_gid    = all_work_info[i].top_gid;
-            max_work.top_work   = all_work_info[i].top_work;
-            max_work.proc_work  = all_work_info[i].proc_work;
-            max_work.nlids      = all_work_info[i].nlids;
-        }
-        if (min_work.proc_rank == -1 || all_work_info[i].proc_work < min_work.proc_work)
-        {
-            min_work.proc_rank  = all_work_info[i].proc_rank;
-            min_work.top_gid    = all_work_info[i].top_gid;
-            min_work.top_work   = all_work_info[i].top_work;
-            min_work.proc_work  = all_work_info[i].proc_work;
-            min_work.nlids      = all_work_info[i].nlids;
-        }
-    }
-
-    // src and dst procs need to differ, and don't leave a proc with no blocks
-    if (max_work.proc_rank != min_work.proc_rank && max_work.nlids > 1)
-    {
-        move_info.move_gid    = max_work.top_gid;
-        move_info.src_proc    = max_work.proc_rank;
-        move_info.dst_proc    = min_work.proc_rank;
-
-        // debug
-//         fmt::print(stderr, "decide_move_info(): move_gid {} src_proc {} dst_proc {}\n",
-//                 move_info.move_gid, move_info.src_proc, move_info.dst_proc);
-    }
-    else
-    {
-        fmt::print(stderr, "decide_move_info(): nothing to move max_work.proc_rank {} min_work.proc_rank {} max_work.nlids {}\n",
-                max_work.proc_rank, min_work.proc_rank, max_work.nlids);
-    }
-
-    return;
-}
-
 // set dynamic assigner blocks to local blocks of master
 // TODO: make a version of DynamicAssigner ctor take master as an arg and do this
 void set_dynamic_assigner(diy::DynamicAssigner&   dynamic_assigner,
@@ -440,11 +645,16 @@ void set_dynamic_assigner(diy::DynamicAssigner&   dynamic_assigner,
 // TODO: make this a member function of dynamic assigner
 void  move_block(diy::DynamicAssigner&   assigner,
                  diy::Master&            master,
-                 const MoveInfo&         move_info)
+                 const MoveInfo&         move_info,
+                 int                     iteration)         // for debugging
 {
-    // TP: this barrier is needed on my laptop at 8 ranks, otherwise moving the block below hangs
+    // debug
+//     fmt::print(stderr, "move_block(): iteration {} move_info move_gid {} src_proc {} dst_proc {}\n",
+//             iteration, move_info.move_gid, move_info.src_proc, move_info.dst_proc);
+
+    // TP: this barrier may help to synchronize the information exchange before moving a block
     // TODO: decide whether it's needed on a production machine
-    master.communicator().barrier();
+//     master.communicator().barrier();
 
     // update the dynamic assigner
     if (master.communicator().rank() == move_info.src_proc)
@@ -491,9 +701,6 @@ void  move_block(diy::DynamicAssigner&   assigner,
         // add block to the master
         master.add(move_info.move_gid, recv_b, recv_link);
     }
-
-    // fix links
-    diy::fix_links(master, assigner);
 }
 
 int main(int argc, char* argv[])
@@ -580,11 +787,13 @@ int main(int argc, char* argv[])
     // dynamic assigner needs to be fully updated and sync'ed across all procs before proceeding
     world.barrier();
 
+    WorkInfo                my_work_info;
     std::vector<WorkInfo>   all_work_info;
     std::vector<WorkInfo>   sample_work_info;
     MoveInfo                move_info;
+    std::vector<MoveInfo>   multi_move_info;
 
-    // load balance summary stats
+    // collect summary stats before beginning
     if (world.rank() == 0)
         fmt::print(stderr, "Summary stats before beginning\n");
     summary_stats(master);
@@ -592,8 +801,6 @@ int main(int argc, char* argv[])
     // perform some iterative algorithm
     for (auto n = 0; n < iters; n++)
     {
-//         fmt::print(stderr, "iter {}\n", n);
-
         // some block computation
         master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
                 { b->compute(cp, max_time, n); });
@@ -607,25 +814,45 @@ int main(int argc, char* argv[])
         if (method == -1)
             continue;
 
-        // exchange info about work balance and decide what to move where
-        else if (method == 0)       // synchronous collective
+        // synchronous collective method
+        else if (method == 0)
         {
+            // exchange info about load balance
             exchange_work_info(master, local_work, all_work_info);
+            // decide what to move where (one block move currently, TODO: more than one block)
             decide_move_info(master, all_work_info, move_info);
+            // move one block from src to dst proc TODO: move more than one block
+            move_block(dynamic_assigner, master, move_info, n);  // TODO: make this a dynamic assigner member function
+            // fix links
+            diy::fix_links(master, dynamic_assigner);
+
+            // debug
+            if (world.rank() == move_info.src_proc)
+                fmt::print(stderr, "iteration {}: moving gid {} from src rank {} to dst rank {}\n",
+                        n, move_info.move_gid, move_info.src_proc, move_info.dst_proc);
         }
-        else if (method == 1)       // sampling
+
+        // sampling method
+        else if (method == 1)
         {
-            exchange_sample_work_info(master, local_work, sample_frac, n, sample_work_info);
-            decide_move_info(master, sample_work_info, move_info);
+            // exchange info about load balance
+            exchange_sample_work_info(master, local_work, sample_frac, n, my_work_info, sample_work_info);
+            // decide what to move where
+            decide_sample_move_info(master, sample_work_info, my_work_info, multi_move_info);
+            // move one blocks from src to dst proc
+            for (auto i = 0; i < multi_move_info.size(); i++)
+            {
+                move_block(dynamic_assigner, master, multi_move_info[i], n);  // TODO: make this a dynamic assigner member function
+
+                // debug
+                if (world.rank() == multi_move_info[i].src_proc)
+                    fmt::print(stderr, "iteration {}: moving gid {} from src rank {} to dst rank {}\n",
+                            n, multi_move_info[i].move_gid, multi_move_info[i].src_proc, multi_move_info[i].dst_proc);
+            }
+            // fix links
+            diy::fix_links(master, dynamic_assigner);
+
         }
-
-        // debug
-        if (world.rank() == move_info.src_proc)
-            fmt::print(stderr, "iteration {}: moving gid {} from src rank {} to dst rank {}\n",
-                    n, move_info.move_gid, move_info.src_proc, move_info.dst_proc);
-
-        // move one block from src to dst proc
-        move_block(dynamic_assigner, master, move_info);  // TODO: make this a dynamic assigner member function
 
         // debug: print the master of src and dst proc
 //         if (world.rank() == move_info.src_proc)
