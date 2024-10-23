@@ -116,6 +116,7 @@ void print_links(const diy::Master& master)
 // TODO: make a master member function
 void exchange_work_info(const diy::Master&      master,
                         std::vector<Work>&      local_work,             // work for each local block TODO: eventually internal to master?
+                        int                     iteration,              // current iteration (for debugging)
                         std::vector<WorkInfo>&  all_work_info)          // (output) global work info
 {
     auto nlids  = master.size();                    // my local number of blocks
@@ -703,6 +704,71 @@ void  move_block(diy::DynamicAssigner&   assigner,
     }
 }
 
+// balance load using collective method
+// TODO move into diy
+void load_balance_collective(
+        diy::Master&                master,             // diy master
+        diy::DynamicAssigner&       dynamic_assigner,   // diy dynamic assigner
+        std::vector<Work>&          local_work,         // work for each local block TODO: eventually internal to master?
+        int                         iter)               // current iteration (for debugging)
+{
+    WorkInfo                my_work_info;               // my mpi process work info
+    std::vector<WorkInfo>   all_work_info;              // work info collected from all mpi processes
+    MoveInfo                move_info;                  // move info for moving one block
+
+    // exchange info about load balance
+    exchange_work_info(master, local_work, iter, all_work_info);
+
+    // decide what to move where
+    decide_move_info(master, all_work_info, move_info);
+
+    // move one block from src to dst proc
+    move_block(dynamic_assigner, master, move_info, iter);
+
+    // debug
+    if (master.communicator().rank() == move_info.src_proc)
+        fmt::print(stderr, "iteration {}: moving gid {} from src rank {} to dst rank {}\n",
+                iter, move_info.move_gid, move_info.src_proc, move_info.dst_proc);
+
+    // fix links
+    diy::fix_links(master, dynamic_assigner);
+}
+
+// balance load using sampling method
+// TODO move into diy
+void load_balance_sampling(
+        diy::Master&                master,
+        diy::DynamicAssigner&       dynamic_assigner,   // diy dynamic assigner
+        std::vector<Work>&          local_work,         // work for each local block TODO: eventually internal to master?
+        float                       sample_frac,        // fraction of procs to sample 0.0 < sample_size <= 1.0
+        int                         iter)               // current iteration (for debugging)
+{
+    WorkInfo                my_work_info;               // my mpi process work info
+    std::vector<WorkInfo>   sample_work_info;           // work info collecting from sampling other mpi processes
+    std::vector<MoveInfo>   multi_move_info;            // move info for moving multiple blocks
+
+    // exchange info about load balance
+    exchange_sample_work_info(master, local_work, sample_frac, iter, my_work_info, sample_work_info);
+
+    // decide what to move where
+    decide_sample_move_info(master, sample_work_info, my_work_info, multi_move_info);
+
+    // move one blocks from src to dst proc
+    for (auto i = 0; i < multi_move_info.size(); i++)
+    {
+        move_block(dynamic_assigner, master, multi_move_info[i], iter);
+
+        // debug
+        if (master.communicator().rank() == multi_move_info[i].src_proc)
+            fmt::print(stderr, "iteration {}: moving gid {} from src rank {} to dst rank {}\n",
+                    iter, multi_move_info[i].move_gid, multi_move_info[i].src_proc, multi_move_info[i].dst_proc);
+    }
+
+    // fix links
+    diy::fix_links(master, dynamic_assigner);
+}
+
+
 int main(int argc, char* argv[])
 {
     diy::mpi::environment     env(argc, argv);                          // diy equivalent of MPI_Init
@@ -816,43 +882,11 @@ int main(int argc, char* argv[])
 
         // synchronous collective method
         else if (method == 0)
-        {
-            // exchange info about load balance
-            exchange_work_info(master, local_work, all_work_info);
-            // decide what to move where (one block move currently, TODO: more than one block)
-            decide_move_info(master, all_work_info, move_info);
-            // move one block from src to dst proc TODO: move more than one block
-            move_block(dynamic_assigner, master, move_info, n);  // TODO: make this a dynamic assigner member function
-            // fix links
-            diy::fix_links(master, dynamic_assigner);
-
-            // debug
-            if (world.rank() == move_info.src_proc)
-                fmt::print(stderr, "iteration {}: moving gid {} from src rank {} to dst rank {}\n",
-                        n, move_info.move_gid, move_info.src_proc, move_info.dst_proc);
-        }
+            load_balance_collective(master, dynamic_assigner, local_work, n);
 
         // sampling method
         else if (method == 1)
-        {
-            // exchange info about load balance
-            exchange_sample_work_info(master, local_work, sample_frac, n, my_work_info, sample_work_info);
-            // decide what to move where
-            decide_sample_move_info(master, sample_work_info, my_work_info, multi_move_info);
-            // move one blocks from src to dst proc
-            for (auto i = 0; i < multi_move_info.size(); i++)
-            {
-                move_block(dynamic_assigner, master, multi_move_info[i], n);  // TODO: make this a dynamic assigner member function
-
-                // debug
-                if (world.rank() == multi_move_info[i].src_proc)
-                    fmt::print(stderr, "iteration {}: moving gid {} from src rank {} to dst rank {}\n",
-                            n, multi_move_info[i].move_gid, multi_move_info[i].src_proc, multi_move_info[i].dst_proc);
-            }
-            // fix links
-            diy::fix_links(master, dynamic_assigner);
-
-        }
+            load_balance_sampling(master, dynamic_assigner, local_work, sample_frac, n);
 
         // debug: print the master of src and dst proc
 //         if (world.rank() == move_info.src_proc)
