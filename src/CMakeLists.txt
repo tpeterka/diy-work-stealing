@@ -1,12 +1,11 @@
-set                         (targets    main)
+set                         (targets    collective sampling none)
 
 foreach                     (t ${targets})
   add_executable            (${t} ${t}.cpp)
   target_link_libraries     (${t} ${libraries})
 endforeach                  ()
 
-install                     (TARGETS
-                            main
+install                     (TARGETS ${targets}
                             DESTINATION ${CMAKE_INSTALL_PREFIX}/bin
                             PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE
                             GROUP_READ GROUP_WRITE GROUP_EXECUTE
