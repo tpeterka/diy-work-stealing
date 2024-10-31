@@ -166,7 +166,7 @@ void   gather_work_info(const diy::Master&      master,
     }
 }
 
-// compute summary stats on work information from all processes
+// compute summary stats on work information on root process
 void stats_work_info(const diy::Master&         master,
                      std::vector<WorkInfo>&     all_work_info)
 {
@@ -176,23 +176,27 @@ void stats_work_info(const diy::Master&         master,
     float avg_work;
     float rel_imbalance;
 
-    for (auto i = 0; i < all_work_info.size(); i++)
+    if (all_work_info.size())
     {
-        if (i == 0 || all_work_info[i].proc_work < min_work)
-            min_work = all_work_info[i].proc_work;
-        if (i == 0 || all_work_info[i].proc_work > max_work)
-            max_work = all_work_info[i].proc_work;
-        tot_work += all_work_info[i].proc_work;
+        for (auto i = 0; i < all_work_info.size(); i++)
+        {
+            if (i == 0 || all_work_info[i].proc_work < min_work)
+                min_work = all_work_info[i].proc_work;
+            if (i == 0 || all_work_info[i].proc_work > max_work)
+                max_work = all_work_info[i].proc_work;
+            tot_work += all_work_info[i].proc_work;
+        }
+
+        avg_work = tot_work / all_work_info.size();
+        rel_imbalance   = float(max_work - min_work) / max_work;
+
+        if (master.communicator().rank() == 0)
+            fmt::print(stderr, "Max process work {} Min process work {} Avg process work {} Rel process imbalance [(max - min) / max] {:.3}\n",
+                    max_work, min_work, avg_work, rel_imbalance);
     }
-
-    avg_work = tot_work / all_work_info.size();
-    rel_imbalance   = float(max_work - min_work) / max_work;
-
-    if (master.communicator().rank() == 0)
-    fmt::print(stderr, "Max process work {} Min process work {} Avg process work {} Rel process imbalance [(max - min) / max] {:.3}\n",
-            max_work, min_work, avg_work, rel_imbalance);
 }
 
+// gather summary stats on work information from all processes
 void summary_stats(const diy::Master& master)
 {
     std::vector<WorkInfo>   all_work_info;
@@ -202,7 +206,8 @@ void summary_stats(const diy::Master& master)
         local_work[i] = static_cast<Block*>(master.block(i))->work;
 
     gather_work_info(master, local_work, all_work_info);
-    stats_work_info(master, all_work_info);
+    if (master.communicator().rank() == 0)
+        stats_work_info(master, all_work_info);
 }
 
 // set dynamic assigner blocks to local blocks of master
