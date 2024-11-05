@@ -67,18 +67,54 @@ void exchange_work_info(const diy::Master&      master,
 // determine move info from work info
 // the user writes this function for now, TODO: implement in diy
 void decide_move_info(const diy::Master&            master,
-                      const std::vector<WorkInfo>&  all_work_info,          // global work info
-                      MoveInfo&                     move_info)              // (output) move info
+                      std::vector<WorkInfo>&        all_work_info,          // global work info
+                      std::vector<MoveInfo>&        all_move_info)          // (output) move info for all moves
 {
+
+    all_move_info.clear();
+
+#if 1       // move all blocks
+
+    // sort all_work_info by proc_work
+    std::sort(all_work_info.begin(), all_work_info.end(),
+            [&](WorkInfo& a, WorkInfo& b) { return a.proc_work < b.proc_work; });
+
+    // walk the all_work_info vector, shuffling heaviest blocks from heaviest procs to lightest procs
+    // an approximation of the greedy list scheduling algorithm, stratified by process
+    // instead of sorting all blocks, sort processes by their total work and then move the heaviest block among processes
+    for (auto i = 0; i < all_work_info.size() / 2; i++)
+    {
+        int dst_idx = i;
+        int src_idx = all_work_info.size() - i - 1;
+
+        // check what the move would do to load balance between the two blocks
+        int old_load_diff = abs(all_work_info[src_idx].proc_work - all_work_info[dst_idx].proc_work);
+        int new_load_diff = abs(all_work_info[src_idx].proc_work - all_work_info[src_idx].top_work -
+                               (all_work_info[dst_idx].proc_work + all_work_info[src_idx].top_work));
+
+        // debug
+//         fmt::print(stderr, "i {} src_proc {} dst_proc {} old_load_diff {} new_load_diff {}\n",
+//                 i, all_work_info[src_idx].proc_rank, all_work_info[dst_idx].proc_rank, old_load_diff, new_load_diff);
+
+        // don't make load balance worse and don't leave a proc with no blocks
+        if (new_load_diff < old_load_diff && all_work_info[src_idx].nlids > 1)
+        {
+            MoveInfo move_info;
+            move_info.src_proc  = all_work_info[src_idx].proc_rank;
+            move_info.dst_proc  = all_work_info[dst_idx].proc_rank;
+            move_info.move_gid  = all_work_info[src_idx].top_gid;
+            all_move_info.push_back(move_info);
+        }
+    }
+    return;
+
+#else       // move one block
+
     // initialize move_info
-    move_info = {-1, -1, -1};
+    MoveInfo move_info = {-1, -1, -1};
 
 //     fmt::print(stderr, "decide_move_info: move_info.move_gid {} move_info.src_proc {} move_info.dst_proc {}\n",
 //             move_info.move_gid, move_info.src_proc, move_info.dst_proc);
-
-    // if my proc is not included in the global work info, nothing to do
-    if (!all_work_info.size())
-        return;
 
     // parse all_work_info to decide block migration, all procs arriving at the same decision
     // for now pick the proc with the max. total work and move its top_gid to the proc with the min. total work
@@ -116,6 +152,7 @@ void decide_move_info(const diy::Master&            master,
         move_info.move_gid    = max_work.top_gid;
         move_info.src_proc    = max_work.proc_rank;
         move_info.dst_proc    = min_work.proc_rank;
+        all_move_info.push_back(move_info);
 
         // debug
 //         fmt::print(stderr, "decide_move_info(): move_gid {} src_proc {} dst_proc {}\n",
@@ -128,6 +165,9 @@ void decide_move_info(const diy::Master&            master,
     }
 
     return;
+
+#endif
+
 }
 
 // move one block from src to dst proc
@@ -138,8 +178,9 @@ void  move_block(diy::DynamicAssigner&   assigner,
                  int                     iteration)         // for debugging
 {
     // debug
-//     fmt::print(stderr, "move_block(): iteration {} move_info move_gid {} src_proc {} dst_proc {}\n",
-//             iteration, move_info.move_gid, move_info.src_proc, move_info.dst_proc);
+    if (master.communicator().rank() == move_info.src_proc)
+        fmt::print(stderr, "iteration {}: moving gid {} from src rank {} to dst rank {}\n",
+                iteration, move_info.move_gid, move_info.src_proc, move_info.dst_proc);
 
     // TP: this barrier may help to synchronize the information exchange before moving a block
     // TODO: decide whether it's needed on a production machine
@@ -202,21 +243,17 @@ void load_balance_collective(
 {
     WorkInfo                my_work_info;               // my mpi process work info
     std::vector<WorkInfo>   all_work_info;              // work info collected from all mpi processes
-    MoveInfo                move_info;                  // move info for moving one block
+    std::vector<MoveInfo>   all_move_info;              // move info for all moves
 
     // exchange info about load balance
     exchange_work_info(master, local_work, iter, all_work_info);
 
     // decide what to move where
-    decide_move_info(master, all_work_info, move_info);
+    decide_move_info(master, all_work_info, all_move_info);
 
-    // move one block from src to dst proc
-    move_block(dynamic_assigner, master, move_info, iter);
-
-    // debug
-    if (master.communicator().rank() == move_info.src_proc)
-        fmt::print(stderr, "iteration {}: moving gid {} from src rank {} to dst rank {}\n",
-                iter, move_info.move_gid, move_info.src_proc, move_info.dst_proc);
+    // move blocks from src to dst proc
+    for (auto i = 0; i < all_move_info.size(); i++)
+        move_block(dynamic_assigner, master, all_move_info[i], iter);
 
     // fix links
     diy::fix_links(master, dynamic_assigner);
@@ -286,11 +323,18 @@ int main(int argc, char* argv[])
                              RGLink*    l   = new RGLink(link);
                              b->gid         = gid;
                              b->bounds      = bounds;
+//                              std::srand((gid + 1) * (master.communicator().rank() + 1));
                              std::srand(gid + 1);
                              b->work        = double(std::rand()) / RAND_MAX * WORK_MAX;
 
                              master.add(gid, b, l);
                          });
+
+//     std::srand(world.rank() + 1);
+
+//     int t = time(0);
+//     fmt::print(stderr, "time {} rank {} time + rank {}\n", t, world.rank(), t + world.rank());
+//     srand(t + world.rank());
 
     world.barrier();                                                    // barrier to synchronize clocks across procs, do not remove
     wall_time = MPI_Wtime();
@@ -303,11 +347,9 @@ int main(int argc, char* argv[])
     // dynamic assigner needs to be fully updated and sync'ed across all procs before proceeding
     world.barrier();
 
-    WorkInfo                my_work_info;
-    std::vector<WorkInfo>   all_work_info;
-    std::vector<WorkInfo>   sample_work_info;
-    MoveInfo                move_info;
-    std::vector<MoveInfo>   multi_move_info;
+    // debug: print each block
+    master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
+            { b->show_block(cp); });
 
     // collect summary stats before beginning
     if (world.rank() == 0)
