@@ -49,7 +49,14 @@ int main(int argc, char* argv[])
     domain.min[0] = domain.min[1] = domain.min[2] = 0;
     domain.max[0] = domain.max[1] = domain.max[2] = 255;
 
-    // "main" master and decomposer for the actual blocks
+    // seed random number generator for user code, broadcast seed, offset by rank
+    time_t t;
+    if (world.rank() == 0)
+        t = time(0);
+    diy::mpi::broadcast(world, t, 0);
+    srand(t + world.rank());
+
+    // create master for managing blocks in this process
     diy::Master master(world,
                        1,                                               // one thread
                        -1,                                              // all blocks in memory
@@ -82,6 +89,10 @@ int main(int argc, char* argv[])
 
     world.barrier();                                                    // barrier to synchronize clocks across procs, do not remove
     wall_time = MPI_Wtime();
+
+    // debug: print each block
+//     master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
+//             { b->show_block(cp); });
 
     // collect summary stats before beginning
     if (world.rank() == 0)

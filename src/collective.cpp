@@ -1,6 +1,5 @@
 #include <vector>
-#include <iostream>
-#include <bitset>
+#include <random>
 
 #include <diy/decomposition.hpp>
 #include <diy/assigner.hpp>
@@ -298,7 +297,14 @@ int main(int argc, char* argv[])
     domain.min[0] = domain.min[1] = domain.min[2] = 0;
     domain.max[0] = domain.max[1] = domain.max[2] = 255;
 
-    // "main" master and decomposer for the actual blocks
+    // seed random number generator for user code, broadcast seed, offset by rank
+    time_t t;
+    if (world.rank() == 0)
+        t = time(0);
+    diy::mpi::broadcast(world, t, 0);
+    srand(t + world.rank());
+
+    // create master for managing blocks in this process
     diy::Master master(world,
                        1,                                               // one thread
                        -1,                                              // all blocks in memory
@@ -323,18 +329,11 @@ int main(int argc, char* argv[])
                              RGLink*    l   = new RGLink(link);
                              b->gid         = gid;
                              b->bounds      = bounds;
-//                              std::srand((gid + 1) * (master.communicator().rank() + 1));
-                             std::srand(gid + 1);
                              b->work        = double(std::rand()) / RAND_MAX * WORK_MAX;
 
                              master.add(gid, b, l);
                          });
 
-//     std::srand(world.rank() + 1);
-
-//     int t = time(0);
-//     fmt::print(stderr, "time {} rank {} time + rank {}\n", t, world.rank(), t + world.rank());
-//     srand(t + world.rank());
 
     world.barrier();                                                    // barrier to synchronize clocks across procs, do not remove
     wall_time = MPI_Wtime();
@@ -348,8 +347,8 @@ int main(int argc, char* argv[])
     world.barrier();
 
     // debug: print each block
-    master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
-            { b->show_block(cp); });
+//     master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
+//             { b->show_block(cp); });
 
     // collect summary stats before beginning
     if (world.rank() == 0)

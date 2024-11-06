@@ -1,6 +1,6 @@
 #include <vector>
-#include <iostream>
-#include <bitset>
+#include <random>
+#include <time.h>
 
 #include <diy/decomposition.hpp>
 #include <diy/assigner.hpp>
@@ -55,7 +55,8 @@ void exchange_sample_work_info(diy::Master&             master,                 
                                float                    sample_frac,            // fraction of procs to sample 0.0 < sample_size <= 1.0
                                int                      iter,                   // current iteration
                                WorkInfo&                my_work_info,           // (output) my work info
-                               std::vector<WorkInfo>&   sample_work_info)       // (output) vector of sorted sample work info, sorted by increasing total work per process
+                               std::vector<WorkInfo>&   sample_work_info,       // (output) vector of sorted sample work info, sorted by increasing total work per process
+                               std::mt19937&            gen)                    // random number generator TODO: include in diy
 {
     auto nlids  = master.size();                    // my local number of blocks
     auto nprocs = master.communicator().size();     // global number of procs
@@ -89,15 +90,15 @@ void exchange_sample_work_info(diy::Master&             master,                 
     };
 
     // pick a random sample of processes, w/o duplicates, and excluding myself
-    int nsamples = sample_frac * nprocs;
+    int nsamples = sample_frac * (nprocs - 1);
     std::set<int> sample_procs;
     for (auto i = 0; i < nsamples; i++)
     {
-        std::srand((iter + 1) * (i + 1) * (my_proc + 1));
         int rand_proc;
         do
         {
-            rand_proc = double(std::rand()) / RAND_MAX * master.communicator().size();
+            std::uniform_int_distribution<> distrib(0, master.communicator().size() - 1);
+            rand_proc = distrib(gen);
         } while (sample_procs.find(rand_proc) != sample_procs.end() || rand_proc == my_proc);
         sample_procs.insert(rand_proc);
     }
@@ -157,12 +158,12 @@ void send_block(Block*                              b,                  // local
                 diy::DynamicAssigner&               dynamic_assigner,   // dynamic assigner
                 const std::vector<WorkInfo>&        sample_work_info,   // sampled work info
                 const WorkInfo&                     my_work_info,       // my work info
+                float                               quantile,           // quantile cutoff above which to move blocks (0.0 - 1.0)
                 int                                 iter)               // current iteration number (for debugging)
 {
     MoveInfo move_info = {-1, -1, -1};
 
-    // pick a cutoff quantile above which to move blocks, see if my rank qualifies
-    float quantile = 0.8;                                                               // TODO: tune this, or make a user parameter
+    // my rank's position in the sampled work info, sorted by proc_work
     int my_work_idx = sample_work_info.size();                                          // index where my work would be in the sample_work
     for (auto i = 0; i < sample_work_info.size(); i++)
     {
@@ -264,11 +265,12 @@ void move_sample_blocks(diy::Master&                    master,                 
                         diy::DynamicAssigner&           dynamic_assigner,       // dynamic assigner
                         const std::vector<WorkInfo>&    sample_work_info,       // sampled work info
                         const WorkInfo&                 my_work_info,           // my work info
+                        float                           quantile,               // quantile cutoff above which to move blocks (0.0 - 1.0)
                         int                             iter)                   // current iteration (for debugging)
 {
     // rexchange moving blocks
     aux_master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
-            { send_block(b, cp, master, dynamic_assigner, sample_work_info, my_work_info, iter); });
+            { send_block(b, cp, master, dynamic_assigner, sample_work_info, my_work_info, quantile, iter); });
     aux_master.exchange(true);      // true = remote
     aux_master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
             { recv_block(b, cp, master); });
@@ -282,7 +284,9 @@ void load_balance_sampling(
         diy::DynamicAssigner&       dynamic_assigner,   // diy dynamic assigner
         std::vector<Work>&          local_work,         // work for each local block TODO: eventually internal to master?
         float                       sample_frac,        // fraction of procs to sample 0.0 < sample_size <= 1.0
-        int                         iter)               // current iteration (for debugging)
+        float                       quantile,           // quantile cutoff above which to move blocks (0.0 - 1.0)
+        int                         iter,               // current iteration (for debugging)
+        std::mt19937&               gen)                // random number generator TODO: include in diy
 {
     WorkInfo                my_work_info;               // my mpi process work info
     std::vector<WorkInfo>   sample_work_info;           // work info collecting from sampling other mpi processes
@@ -298,10 +302,10 @@ void load_balance_sampling(
     aux_decomposer.decompose(master.communicator().rank(), aux_assigner, aux_master);
 
     // exchange info about load balance
-    exchange_sample_work_info(master, aux_master, local_work, sample_frac, iter, my_work_info, sample_work_info);
+    exchange_sample_work_info(master, aux_master, local_work, sample_frac, iter, my_work_info, sample_work_info, gen);
 
     // move blocks
-    move_sample_blocks(master, aux_master, dynamic_assigner, sample_work_info, my_work_info, iter);
+    move_sample_blocks(master, aux_master, dynamic_assigner, sample_work_info, my_work_info, quantile, iter);
 
     // fix links
     diy::fix_links(master, dynamic_assigner);
@@ -314,7 +318,8 @@ int main(int argc, char* argv[])
     int                       bpr = 4;                                  // blocks per rank
     int                       iters = 1;                                // number of iterations to run
     int                       max_time = 1;                             // maximum time to compute a block (sec.)
-    float                     sample_frac = 0.5;                        // fraction of world procs to sample
+    float                     sample_frac = 0.5;                        // fraction of world procs to sample (0.0 - 1.0)
+    float                     quantile = 0.8;                           // quantile cutoff above which to move blocks (0.0 - 1.0)
     double                    wall_time;                                // wall clock execution time for entire code
     bool                      help;
 
@@ -325,7 +330,8 @@ int main(int argc, char* argv[])
         >> Option('b', "bpr",           bpr,            "number of diy blocks per mpi rank")
         >> Option('i', "iters",         iters,          "number of iterations")
         >> Option('t', "max_time",      max_time,       "maximum time to compute a block (in seconds)")
-        >> Option('s', "sample_frac",   sample_frac,    "fraction of world procs to sample")
+        >> Option('s', "sample_frac",   sample_frac,    "fraction of world procs to sample (0.0 - 1.0)")
+        >> Option('q', "quantile",      quantile,       "quantile cutoff above which to move blocks (0.0 - 1.0)")
         ;
 
     if (!ops.parse(argc,argv) || help)
@@ -347,6 +353,20 @@ int main(int argc, char* argv[])
     Bounds domain(3);                                                   // global data size
     domain.min[0] = domain.min[1] = domain.min[2] = 0;
     domain.max[0] = domain.max[1] = domain.max[2] = 255;
+
+    // seed random number generator for diy, broadcast seed, offset by rank
+    // TODO: move this into diy
+    std::random_device rd;                      // seed source for the random number engine
+    uint s = rd();
+    diy::mpi::broadcast(world, s, 0);
+    std::mt19937 gen(s + world.rank());         // mersenne_twister_engine
+
+    // seed random number generator for user code, broadcast seed, offset by rank
+    time_t t;
+    if (world.rank() == 0)
+        t = time(0);
+    diy::mpi::broadcast(world, t, 0);
+    srand(t + world.rank());
 
     // create master for managing blocks in this process
     diy::Master master(world,
@@ -373,9 +393,7 @@ int main(int argc, char* argv[])
                              RGLink*    l   = new RGLink(link);
                              b->gid         = gid;
                              b->bounds      = bounds;
-                             std::srand(gid + 1);
                              b->work        = double(std::rand()) / RAND_MAX * WORK_MAX;
-
                              master.add(gid, b, l);
                          });
 
@@ -396,6 +414,10 @@ int main(int argc, char* argv[])
     MoveInfo                move_info;
     std::vector<MoveInfo>   multi_move_info;
 
+    // debug: print each block
+//     master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
+//             { b->show_block(cp); });
+
     // collect summary stats before beginning
     if (world.rank() == 0)
         fmt::print(stderr, "Summary stats before beginning\n");
@@ -414,7 +436,7 @@ int main(int argc, char* argv[])
             local_work[i] = static_cast<Block*>(master.block(i))->work;
 
         // sampling load balancing method
-        load_balance_sampling(master, static_assigner, dynamic_assigner, local_work, sample_frac, n);
+        load_balance_sampling(master, static_assigner, dynamic_assigner, local_work, sample_frac, quantile, n, gen);
     }
 
     // debug: print the master
