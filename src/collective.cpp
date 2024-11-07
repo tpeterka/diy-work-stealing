@@ -1,4 +1,5 @@
 #include <vector>
+#include <queue>
 #include <random>
 
 #include <diy/decomposition.hpp>
@@ -64,7 +65,7 @@ void exchange_work_info(const diy::Master&      master,
 }
 
 // determine move info from work info
-// the user writes this function for now, TODO: implement in diy
+// TODO: implement in diy
 void decide_move_info(const diy::Master&            master,
                       std::vector<WorkInfo>&        all_work_info,          // global work info
                       std::vector<MoveInfo>&        all_move_info)          // (output) move info for all moves
@@ -73,6 +74,69 @@ void decide_move_info(const diy::Master&            master,
     all_move_info.clear();
 
 #if 1       // move all blocks
+
+    // an approximation to the longest processing time first (LPTF) scheduling algorithm
+    // https://en.wikipedia.org/wiki/Longest-processing-time-first_scheduling
+    // we iteratively move the heaviest block to lightest proc
+    // given that we only store the heaviest block for each proc, not all blocks
+
+    // minimum proc_work priority queue, top is min proc_work
+    auto cmp = [&](WorkInfo& a, WorkInfo& b) { return a.proc_work > b.proc_work; };
+    std::priority_queue<WorkInfo, std::vector<WorkInfo>, decltype(cmp)> min_proc_work_q(cmp);
+    for (auto i = 0; i < all_work_info.size(); i++)
+        min_proc_work_q.push(all_work_info[i]);
+
+    // sort all_work_info by descending top_work
+    std::sort(all_work_info.begin(), all_work_info.end(),
+            [&](WorkInfo& a, WorkInfo& b) { return a.top_work > b.top_work; });
+
+    // debug
+//     if (master.communicator().rank() == 0)
+//     {
+//         for (auto i = 0; i < all_work_info.size(); i++)
+//             fmt::print(stderr, "all_work_info[{}].top_work {} top_gid {} proc_rank {} proc_work {}\n",
+//                     i, all_work_info[i].top_work, all_work_info[i].top_gid, all_work_info[i].proc_rank, all_work_info[i].proc_work);
+//     }
+
+    // walk the all_work_info vector in descending top_work order
+    // move the next heaviest block to the lightest proc
+    for (auto i = 0; i < all_work_info.size(); i++)
+    {
+        auto src_work_info = all_work_info[i];                      // heaviest block
+        auto dst_work_info = min_proc_work_q.top();                 // lightest proc
+
+        // sanity check that the move makes sense
+        if (src_work_info.proc_work - dst_work_info.proc_work > src_work_info.top_work &&   // improve load balance
+                src_work_info.proc_rank != dst_work_info.proc_rank &&                       // not self
+                src_work_info.nlids > 1)                                                    // don't leave a proc with no blocks
+        {
+            MoveInfo move_info;
+            move_info.src_proc  = src_work_info.proc_rank;
+            move_info.dst_proc  = dst_work_info.proc_rank;
+            move_info.move_gid  = src_work_info.top_gid;
+            all_move_info.push_back(move_info);
+
+            // debug
+//             if (master.communicator().rank() == 0)
+//                 fmt::print(stderr, "move_info.src_proc {} dst_proc {} move_gid {}\n",
+//                         move_info.src_proc, move_info.dst_proc, move_info.move_gid);
+
+            // update the min_proc_work priority queue
+            auto work_info = min_proc_work_q.top();                 // lightest proc
+            work_info.proc_work += src_work_info.top_work;
+            if (work_info.top_work < src_work_info.top_work)
+            {
+                work_info.top_work = src_work_info.top_work;
+                work_info.top_gid  = src_work_info.top_gid;
+            }
+            min_proc_work_q.pop();
+            min_proc_work_q.push(work_info);
+        }
+    }
+
+    return;
+
+    // DEPRECATED
 
     // sort all_work_info by proc_work
     std::sort(all_work_info.begin(), all_work_info.end(),

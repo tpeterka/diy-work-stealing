@@ -11,7 +11,7 @@
 #include "common.hpp"
 
 // send requests for work info
-void send_req(Block* b,                                 // local block
+void send_req(AuxBlock* b,                              // local block
               const diy::Master::ProxyWithLink& cp,     // communication proxy for neighbor blocks
               std::set<int>& procs)                     // processes to query
 {
@@ -27,7 +27,7 @@ void send_req(Block* b,                                 // local block
 }
 
 // receive requests for work info
-void recv_req(Block* b,                                 // local block
+void recv_req(AuxBlock* b,                              // local block
               const diy::Master::ProxyWithLink& cp,     // communication proxy for neighbor blocks
               std::vector<int>& req_procs)              // processes requesting work info
 {
@@ -97,7 +97,7 @@ void exchange_sample_work_info(diy::Master&             master,                 
         int rand_proc;
         do
         {
-            std::uniform_int_distribution<> distrib(0, master.communicator().size() - 1);
+            std::uniform_int_distribution<> distrib(0, nprocs - 1);     // inclusive
             rand_proc = distrib(gen);
         } while (sample_procs.find(rand_proc) != sample_procs.end() || rand_proc == my_proc);
         sample_procs.insert(rand_proc);
@@ -108,33 +108,36 @@ void exchange_sample_work_info(diy::Master&             master,                 
 
     // rexchange requests for work info
     std::vector<int> req_procs;     // requests for work info received from these processes
-    aux_master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
+    aux_master.foreach([&](AuxBlock* b, const diy::Master::ProxyWithLink& cp)
             { send_req(b, cp, sample_procs); });
     aux_master.exchange(true);      // true = remote
-    aux_master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
+    aux_master.foreach([&](AuxBlock* b, const diy::Master::ProxyWithLink& cp)
             { recv_req(b, cp, req_procs); });
 
     // debug
 //     fmt::print(stderr, "req_procs [{}]\n", fmt::join(req_procs, ","));
 
     // send work info
+    int work_info_tag = 0;
     std::vector<diy::mpi::request> reqs(req_procs.size());
     for (auto i = 0; i < req_procs.size(); i++)
-        reqs[i] = master.communicator().isend(req_procs[i], 0, my_work_info_vec);
+//         reqs[i] = aux_master.communicator().isend(req_procs[i], work_info_tag, my_work_info_vec);
+        reqs[i] = master.communicator().isend(req_procs[i], work_info_tag, my_work_info_vec);
 
     // receive work info
-    int i = 0;
+    // TODO: std::length error below when using aux_master instead of master.communicator()
     std::vector<int>   other_work_info_vec(5);
     sample_work_info.resize(nsamples);
-    for (auto proc_iter = sample_procs.begin(); proc_iter != sample_procs.end(); proc_iter++)
+    for (auto i = 0; i < nsamples; i++)
     {
-        master.communicator().recv(diy::mpi::any_source, 0, other_work_info_vec);
+//         aux_master.communicator().recv(diy::mpi::any_source, work_info_tag, other_work_info_vec);
+        master.communicator().recv(diy::mpi::any_source, work_info_tag, other_work_info_vec);
+
         sample_work_info[i].proc_rank = other_work_info_vec[0];
         sample_work_info[i].top_gid   = other_work_info_vec[1];
         sample_work_info[i].top_work  = other_work_info_vec[2];
         sample_work_info[i].proc_work = other_work_info_vec[3];
         sample_work_info[i].nlids     = other_work_info_vec[4];
-        i++;
     }
 
     // ensure all the send requests cleared
@@ -152,7 +155,7 @@ void exchange_sample_work_info(diy::Master&             master,                 
 }
 
 // send block
-void send_block(Block*                              b,                  // local block
+void send_block(AuxBlock*                           b,                  // local block
                 const diy::Master::ProxyWithLink&   cp,                 // communication proxy for neighbor blocks
                 diy::Master&                        master,             // real master with multiple blocks per process
                 diy::DynamicAssigner&               dynamic_assigner,   // dynamic assigner
@@ -223,7 +226,7 @@ void send_block(Block*                              b,                  // local
 }
 
 // receive block
-void recv_block(Block* b,                                       // local block
+void recv_block(AuxBlock*                           b,          // local block
                 const diy::Master::ProxyWithLink&   cp,         // communication proxy for neighbor blocks
                 diy::Master&                        master)     // real master with multiple blocks per process
 {
@@ -269,10 +272,10 @@ void move_sample_blocks(diy::Master&                    master,                 
                         int                             iter)                   // current iteration (for debugging)
 {
     // rexchange moving blocks
-    aux_master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
+    aux_master.foreach([&](AuxBlock* b, const diy::Master::ProxyWithLink& cp)
             { send_block(b, cp, master, dynamic_assigner, sample_work_info, my_work_info, quantile, iter); });
     aux_master.exchange(true);      // true = remote
-    aux_master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
+    aux_master.foreach([&](AuxBlock* b, const diy::Master::ProxyWithLink& cp)
             { recv_block(b, cp, master); });
 }
 
@@ -293,13 +296,13 @@ void load_balance_sampling(
     std::vector<MoveInfo>   multi_move_info;            // move info for moving multiple blocks
 
     // "auxiliary" master and decomposer for using rexchange for load balancing, 1 block per process
-    Bounds domain(1);                                   // any fake domain
-    domain.min[0] = 0;
-    domain.max[0] = master.communicator().size() + 1;
-    diy::Master                     aux_master(master.communicator(), 1, -1, &Block::create, &Block::destroy);
-    diy::ContiguousAssigner         aux_assigner(master.communicator().size(), master.communicator().size());
-    diy::RegularDecomposer<Bounds>  aux_decomposer(1, domain, master.communicator().size());
-    aux_decomposer.decompose(master.communicator().rank(), aux_assigner, aux_master);
+    diy::Master                     aux_master(master.communicator(), 1, -1, &AuxBlock::create, &AuxBlock::destroy);
+    diy::ContiguousAssigner         aux_assigner(aux_master.communicator().size(), aux_master.communicator().size());
+    Bounds aux_domain(1);                               // any fake domain
+    aux_domain.min[0] = 0;
+    aux_domain.max[0] = aux_master.communicator().size() + 1;
+    diy::RegularDecomposer<Bounds>  aux_decomposer(1, aux_domain, aux_master.communicator().size());
+    aux_decomposer.decompose(aux_master.communicator().rank(), aux_assigner, aux_master);
 
     // exchange info about load balance
     exchange_sample_work_info(master, aux_master, local_work, sample_frac, iter, my_work_info, sample_work_info, gen);

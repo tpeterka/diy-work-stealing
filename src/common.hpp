@@ -86,6 +86,13 @@ struct Block
     Work                work;                                           // some estimate of how much work this block involves
 };
 
+// auxiliary empty block structure
+struct AuxBlock
+{
+    static void*    create()            { return new AuxBlock; }
+    static void     destroy(void* b)    { delete static_cast<AuxBlock*>(b); }
+};
+
 // debug: print DynamicAssigner
 void print_dynamic_assigner(const diy::Master&            master,
                             const diy::DynamicAssigner&   dynamic_assigner)
@@ -192,7 +199,7 @@ void stats_work_info(const diy::Master&         master,
         {
             fmt::print(stderr, "Max process work {} Min process work {} Avg process work {} Rel process imbalance [(max - min) / max] {:.3}\n",
                     max_work, min_work, avg_work, rel_imbalance);
-//             fmt::print(stderr, "Detailed list of all procs work:\n");
+            fmt::print(stderr, "Detailed list of all procs work:\n");
 //             for (auto i = 0; i < all_work_info.size(); i++)
 //                 fmt::print(stderr, "proc rank {} proc work {} top gid {} top gid work {}\n",
 //                         all_work_info[i].proc_rank, all_work_info[i].proc_work, all_work_info[i].top_gid, all_work_info[i].top_work);
