@@ -70,15 +70,12 @@ void decide_move_info(const diy::Master&            master,
                       std::vector<WorkInfo>&        all_work_info,          // global work info
                       std::vector<MoveInfo>&        all_move_info)          // (output) move info for all moves
 {
-
     all_move_info.clear();
 
-#if 1       // move all blocks
-
-    // an approximation to the longest processing time first (LPTF) scheduling algorithm
+    // move all blocks with an approximation to the longest processing time first (LPTF) scheduling algorithm
     // https://en.wikipedia.org/wiki/Longest-processing-time-first_scheduling
     // we iteratively move the heaviest block to lightest proc
-    // given that we only store the heaviest block for each proc, not all blocks
+    // constrained by only recording the heaviest block for each proc, not all blocks
 
     // minimum proc_work priority queue, top is min proc_work
     auto cmp = [&](WorkInfo& a, WorkInfo& b) { return a.proc_work > b.proc_work; };
@@ -133,104 +130,6 @@ void decide_move_info(const diy::Master&            master,
             min_proc_work_q.push(work_info);
         }
     }
-
-    return;
-
-    // DEPRECATED
-
-    // sort all_work_info by proc_work
-    std::sort(all_work_info.begin(), all_work_info.end(),
-            [&](WorkInfo& a, WorkInfo& b) { return a.proc_work < b.proc_work; });
-
-    // walk the all_work_info vector, shuffling heaviest blocks from heaviest procs to lightest procs
-    // an approximation of the greedy list scheduling algorithm, stratified by process
-    // instead of sorting all blocks, sort processes by their total work and then move the heaviest block among processes
-    for (auto i = 0; i < all_work_info.size() / 2; i++)
-    {
-        int dst_idx = i;
-        int src_idx = all_work_info.size() - i - 1;
-
-        // check what the move would do to load balance between the two blocks
-        int old_load_diff = abs(all_work_info[src_idx].proc_work - all_work_info[dst_idx].proc_work);
-        int new_load_diff = abs(all_work_info[src_idx].proc_work - all_work_info[src_idx].top_work -
-                               (all_work_info[dst_idx].proc_work + all_work_info[src_idx].top_work));
-
-        // debug
-//         fmt::print(stderr, "i {} src_proc {} dst_proc {} old_load_diff {} new_load_diff {}\n",
-//                 i, all_work_info[src_idx].proc_rank, all_work_info[dst_idx].proc_rank, old_load_diff, new_load_diff);
-
-        // don't make load balance worse and don't leave a proc with no blocks
-        if (new_load_diff < old_load_diff && all_work_info[src_idx].nlids > 1)
-        {
-            MoveInfo move_info;
-            move_info.src_proc  = all_work_info[src_idx].proc_rank;
-            move_info.dst_proc  = all_work_info[dst_idx].proc_rank;
-            move_info.move_gid  = all_work_info[src_idx].top_gid;
-            all_move_info.push_back(move_info);
-        }
-    }
-    return;
-
-#else       // move one block
-
-    // initialize move_info
-    MoveInfo move_info = {-1, -1, -1};
-
-//     fmt::print(stderr, "decide_move_info: move_info.move_gid {} move_info.src_proc {} move_info.dst_proc {}\n",
-//             move_info.move_gid, move_info.src_proc, move_info.dst_proc);
-
-    // parse all_work_info to decide block migration, all procs arriving at the same decision
-    // for now pick the proc with the max. total work and move its top_gid to the proc with the min. total work
-    // TODO later we can be more sophisticated, e.g., cut the work difference in half, etc., see related literature for guidance
-    WorkInfo max_work = {-1, -1, 0, 0, 0};
-    WorkInfo min_work = {-1, -1, 0, 0, 0};
-
-    for (auto i = 0; i < all_work_info.size(); i++)                         // for all process ranks being considered (entire world or a sample)
-    {
-        // debug
-//         fmt::print(stderr, "all_work_info[{}]: [{} {} {} {} {}]\n",
-//             i, all_work_info[i].proc_rank, all_work_info[i].top_gid, all_work_info[i].top_work, all_work_info[i].proc_work, all_work_info[i].nlids);
-
-        if (max_work.proc_rank == -1 || all_work_info[i].proc_work > max_work.proc_work)
-        {
-            max_work.proc_rank  = all_work_info[i].proc_rank;
-            max_work.top_gid    = all_work_info[i].top_gid;
-            max_work.top_work   = all_work_info[i].top_work;
-            max_work.proc_work  = all_work_info[i].proc_work;
-            max_work.nlids      = all_work_info[i].nlids;
-        }
-        if (min_work.proc_rank == -1 || all_work_info[i].proc_work < min_work.proc_work)
-        {
-            min_work.proc_rank  = all_work_info[i].proc_rank;
-            min_work.top_gid    = all_work_info[i].top_gid;
-            min_work.top_work   = all_work_info[i].top_work;
-            min_work.proc_work  = all_work_info[i].proc_work;
-            min_work.nlids      = all_work_info[i].nlids;
-        }
-    }
-
-    // src and dst procs need to differ, and don't leave a proc with no blocks
-    if (max_work.proc_rank != min_work.proc_rank && max_work.nlids > 1)
-    {
-        move_info.move_gid    = max_work.top_gid;
-        move_info.src_proc    = max_work.proc_rank;
-        move_info.dst_proc    = min_work.proc_rank;
-        all_move_info.push_back(move_info);
-
-        // debug
-//         fmt::print(stderr, "decide_move_info(): move_gid {} src_proc {} dst_proc {}\n",
-//                 move_info.move_gid, move_info.src_proc, move_info.dst_proc);
-    }
-    else
-    {
-        fmt::print(stderr, "decide_move_info(): nothing to move max_work.proc_rank {} min_work.proc_rank {} max_work.nlids {}\n",
-                max_work.proc_rank, min_work.proc_rank, max_work.nlids);
-    }
-
-    return;
-
-#endif
-
 }
 
 // move one block from src to dst proc
