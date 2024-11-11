@@ -144,10 +144,6 @@ void  move_block(diy::DynamicAssigner&   assigner,
         fmt::print(stderr, "iteration {}: moving gid {} from src rank {} to dst rank {}\n",
                 iteration, move_info.move_gid, move_info.src_proc, move_info.dst_proc);
 
-    // TP: this barrier may help to synchronize the information exchange before moving a block
-    // TODO: decide whether it's needed on a production machine
-//     master.communicator().barrier();
-
     // update the dynamic assigner
     if (master.communicator().rank() == move_info.src_proc)
         assigner.set_rank(move_info.dst_proc, move_info.move_gid, true);
@@ -292,6 +288,11 @@ int main(int argc, char* argv[])
                              RGLink*    l   = new RGLink(link);
                              b->gid         = gid;
                              b->bounds      = bounds;
+
+                             // TODO: comment out the following line for actual random work
+                             // generation, leave uncommented for reproducible work generation
+                             std::srand(gid + 1);
+
                              b->work        = double(std::rand()) / RAND_MAX * WORK_MAX;
 
                              master.add(gid, b, l);

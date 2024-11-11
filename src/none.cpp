@@ -81,7 +81,11 @@ int main(int argc, char* argv[])
                              RGLink*    l   = new RGLink(link);
                              b->gid         = gid;
                              b->bounds      = bounds;
+
+                             // TODO: comment out the following line for actual random work
+                             // generation, leave uncommented for reproducible work generation
                              std::srand(gid + 1);
+
                              b->work        = double(std::rand()) / RAND_MAX * WORK_MAX;
 
                              master.add(gid, b, l);
