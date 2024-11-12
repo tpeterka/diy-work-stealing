@@ -225,6 +225,9 @@ int main(int argc, char* argv[])
     int                       iters = 1;                                // number of iterations to run
     int                       max_time = 1;                             // maximum time to compute a block (sec.)
     double                    wall_time;                                // wall clock execution time for entire code
+    double                    comp_time = 0.0;                          // total computation time (sec.)
+    double                    balance_time = 0.0;                       // total load balancing time (sec.)
+    double                    t0;                                       // starting time (sec.)
     bool                      help;
 
     using namespace opts;
@@ -299,12 +302,23 @@ int main(int argc, char* argv[])
                          });
 
 
+    // collect summary stats before beginning
+    if (world.rank() == 0)
+        fmt::print(stderr, "Summary stats before beginning\n");
+    summary_stats(master);
+
+    // timing
     world.barrier();                                                    // barrier to synchronize clocks across procs, do not remove
     wall_time = MPI_Wtime();
+    t0 = MPI_Wtime();
 
     // copy static assigner to dynamic assigner
     diy::DynamicAssigner    dynamic_assigner(world, world.size(), nblocks);
     set_dynamic_assigner(dynamic_assigner, master);                       // TODO: make a version of DynamicAssigner ctor take master and do this
+
+    // timing
+    world.barrier();
+    balance_time += (MPI_Wtime() - t0);
 
     // this barrier is mandatory, do not remove
     // dynamic assigner needs to be fully updated and sync'ed across all procs before proceeding
@@ -314,17 +328,21 @@ int main(int argc, char* argv[])
 //     master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
 //             { b->show_block(cp); });
 
-    // collect summary stats before beginning
-    if (world.rank() == 0)
-        fmt::print(stderr, "Summary stats before beginning\n");
-    summary_stats(master);
-
     // perform some iterative algorithm
     for (auto n = 0; n < iters; n++)
     {
+        // timing
+        world.barrier();
+        t0 = MPI_Wtime();
+
         // some block computation
         master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
                 { b->compute(cp, max_time, n); });
+
+        // timing
+        world.barrier();
+        comp_time += (MPI_Wtime() - t0);
+        t0 = MPI_Wtime();
 
         // compile my local work info
         std::vector<Work> local_work(master.size());
@@ -333,6 +351,10 @@ int main(int argc, char* argv[])
 
         // synchronous collective load balancing
         load_balance_collective(master, dynamic_assigner, local_work, n);
+
+        // timing
+        world.barrier();
+        balance_time += (MPI_Wtime() - t0);
 
         // debug: print the master of src and dst proc
 //         if (world.rank() == move_info.src_proc)
@@ -349,7 +371,8 @@ int main(int argc, char* argv[])
     world.barrier();                                    // barrier to synchronize clocks over procs, do not remove
     wall_time = MPI_Wtime() - wall_time;
     if (world.rank() == 0)
-        fmt::print(stderr, "Total elapsed wall time {:.3} sec.\n", wall_time);
+        fmt::print(stderr, "Total elapsed wall time {:.4} s = computation time {:.4} s + balancing time {:.4} s.\n",
+                wall_time, comp_time, balance_time);
 
     // load balance summary stats
     if (world.rank() == 0)

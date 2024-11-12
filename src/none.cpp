@@ -91,8 +91,10 @@ int main(int argc, char* argv[])
                              master.add(gid, b, l);
                          });
 
-    world.barrier();                                                    // barrier to synchronize clocks across procs, do not remove
-    wall_time = MPI_Wtime();
+    // debug: sanity check that communicator is correct
+    char hostname[256];
+    gethostname(hostname, sizeof(hostname));
+    fmt::print(stderr, "comm size {} comm rank {} hostname{}\n", world.size(), world.rank(), hostname);
 
     // debug: print each block
 //     master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
@@ -102,6 +104,9 @@ int main(int argc, char* argv[])
     if (world.rank() == 0)
         fmt::print(stderr, "Summary stats before beginning\n");
     summary_stats(master);
+
+    world.barrier();                                                    // barrier to synchronize clocks across procs, do not remove
+    wall_time = MPI_Wtime();
 
     // perform some iterative algorithm
     for (auto n = 0; n < iters; n++)

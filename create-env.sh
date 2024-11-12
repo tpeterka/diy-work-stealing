@@ -14,7 +14,7 @@ echo "activating spack environment"
 spack env activate $SPACKENV
 
 spack add mpich@4
-spack add diy
+spack add diy@master
 spack add fmt
 spack add spdlog
 
