@@ -177,51 +177,64 @@ void send_block(AuxBlock*                           b,                  // local
         }
     }
 
-    // send my heaviest block if it passes the quantile cutoff and I won't run out of blocks
-    if (my_work_idx >= quantile * sample_work_info.size() && master.size() > 1)
+    // send my heaviest block if it passes the quantile cutoff
+    if (my_work_idx >= quantile * sample_work_info.size())
     {
+        // debug
+//         fmt::print(stderr, "my_work_idx {} sample_work_info size {}\n", my_work_idx, sample_work_info.size());
+
         // pick the destination process to be the mirror image of my work location in the samples
         // ie, the heavier my process, the lighter the destination process
         int target = sample_work_info.size() - my_work_idx;
 
-        move_info.move_gid = my_work_info.top_gid;
-        move_info.src_proc = my_work_info.proc_rank;
-        move_info.dst_proc = sample_work_info[target].proc_rank;
+        auto src_work_info = my_work_info;
+        auto dst_work_info = sample_work_info[target];
 
-        // debug
-        //             fmt::print(stderr, "decide_sample_move_info(): my_work {} move_gid {} src_proc {} dst_proc {}\n",
-        //                     my_work_info.proc_work, move_info.move_gid, move_info.src_proc, move_info.dst_proc);
+        // sanity check that the move makes sense
+        if (src_work_info.proc_work - dst_work_info.proc_work > src_work_info.top_work &&   // improve load balance
+                src_work_info.proc_rank != dst_work_info.proc_rank &&                       // not self
+                src_work_info.nlids > 1)                                                    // don't leave a proc with no blocks
+        {
 
-        // update the dynamic assigner
-        dynamic_assigner.set_rank(move_info.dst_proc, move_info.move_gid, true);
+            move_info.move_gid = my_work_info.top_gid;
+            move_info.src_proc = my_work_info.proc_rank;
+            move_info.dst_proc = sample_work_info[target].proc_rank;
 
-        // destination in aux_master, where gid = proc
-        diy::BlockID dest_block = {move_info.dst_proc, move_info.dst_proc};
+            // debug
+            //             fmt::print(stderr, "decide_sample_move_info(): my_work {} move_gid {} src_proc {} dst_proc {}\n",
+            //                     my_work_info.proc_work, move_info.move_gid, move_info.src_proc, move_info.dst_proc);
 
-        // enqueue the gid of the moving block
-        cp.enqueue(dest_block, move_info.move_gid);
+            // update the dynamic assigner
+            dynamic_assigner.set_rank(move_info.dst_proc, move_info.move_gid, true);
 
-        // enqueue the block
-        void* send_b;
-        send_b = master.block(master.lid(move_info.move_gid));
-        diy::MemoryBuffer bb;
-        master.saver()(send_b, bb);
-        cp.enqueue(dest_block, bb.buffer);
+            // destination in aux_master, where gid = proc
+            diy::BlockID dest_block = {move_info.dst_proc, move_info.dst_proc};
 
-        // enqueue the link for the block
-        diy::Link* send_link = master.link(master.lid(move_info.move_gid));
-        diy::LinkFactory::save(bb, send_link);
-        cp.enqueue(dest_block, bb.buffer);
+            // enqueue the gid of the moving block
+            cp.enqueue(dest_block, move_info.move_gid);
 
-        // remove the block from the master
-        Block* delete_block = static_cast<Block*>(master.get(master.lid(move_info.move_gid)));
-        master.release(master.lid(move_info.move_gid));
-        delete delete_block;
+            // enqueue the block
+            void* send_b;
+            send_b = master.block(master.lid(move_info.move_gid));
+            diy::MemoryBuffer bb;
+            master.saver()(send_b, bb);
+            cp.enqueue(dest_block, bb.buffer);
 
-        // debug
-        if (master.communicator().rank() == move_info.src_proc)
-            fmt::print(stderr, "iteration {}: moving gid {} from src rank {} to dst rank {}\n",
-                    iter, move_info.move_gid, move_info.src_proc, move_info.dst_proc);
+            // enqueue the link for the block
+            diy::Link* send_link = master.link(master.lid(move_info.move_gid));
+            diy::LinkFactory::save(bb, send_link);
+            cp.enqueue(dest_block, bb.buffer);
+
+            // remove the block from the master
+            Block* delete_block = static_cast<Block*>(master.get(master.lid(move_info.move_gid)));
+            master.release(master.lid(move_info.move_gid));
+            delete delete_block;
+
+            // debug
+            if (master.communicator().rank() == move_info.src_proc)
+                fmt::print(stderr, "iteration {}: moving gid {} from src rank {} to dst rank {}\n",
+                        iter, move_info.move_gid, move_info.src_proc, move_info.dst_proc);
+        }
     }
 }
 
