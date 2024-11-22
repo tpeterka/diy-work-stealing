@@ -5,7 +5,6 @@
 #include <diy/decomposition.hpp>
 #include <diy/assigner.hpp>
 #include <diy/master.hpp>
-#include <diy/resolve.hpp>
 #include <diy/algorithms.hpp>
 
 #include "opts.h"
