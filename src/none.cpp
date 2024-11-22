@@ -1,11 +1,6 @@
-#include <vector>
-#include <iostream>
-#include <bitset>
-
 #include <diy/decomposition.hpp>
 #include <diy/assigner.hpp>
 #include <diy/master.hpp>
-#include <diy/resolve.hpp>
 
 #include "opts.h"
 #include "common.hpp"
@@ -92,9 +87,9 @@ int main(int argc, char* argv[])
                          });
 
     // debug: sanity check that communicator is correct
-    char hostname[256];
-    gethostname(hostname, sizeof(hostname));
-    fmt::print(stderr, "comm size {} comm rank {} hostname{}\n", world.size(), world.rank(), hostname);
+//     char hostname[256];
+//     gethostname(hostname, sizeof(hostname));
+//     fmt::print(stderr, "comm size {} comm rank {} hostname{}\n", world.size(), world.rank(), hostname);
 
     // debug: print each block
 //     master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
@@ -111,6 +106,10 @@ int main(int argc, char* argv[])
     // perform some iterative algorithm
     for (auto n = 0; n < iters; n++)
     {
+        // debug
+        if (world.rank() == 0)
+            fmt::print(stderr, "iteration {}\n", n);
+
         // some block computation
         master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
                 { b->compute(cp, max_time, n); });

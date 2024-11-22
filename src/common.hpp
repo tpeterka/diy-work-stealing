@@ -1,38 +1,11 @@
 #include <vector>
 
-#include <diy/decomposition.hpp>
-#include <diy/assigner.hpp>
-#include <diy/master.hpp>
-#include <diy/resolve.hpp>
-
 #include "opts.h"
 
 #define WORK_MAX    100                 // maximum work a block can have (in some user-defined units)
 
-using Work = int;
-
 typedef     diy::DiscreteBounds         Bounds;
 typedef     diy::RegularGridLink        RGLink;
-
-// information about a process' workload
-struct WorkInfo
-{
-    int     proc_rank;          // mpi rank of this process
-    int     top_gid;            // gid of most expensive block in this process TODO: can be top-k-gids, as long as k is fixed and known by all
-    Work    top_work;           // work of top_gid TODO: can be vector of top-k work, as long as k is fixed and known by all
-    Work    proc_work;          // total work of this process
-    int     nlids;              // local number of blocks in this process
-};
-
-// information about a block that is moving
-struct MoveInfo
-{
-    MoveInfo(): move_gid(-1), src_proc(-1), dst_proc(-1)   {}
-    MoveInfo(int move_gid_, int src_proc_, int dst_proc_) : move_gid(move_gid_), src_proc(src_proc_), dst_proc(dst_proc_) {}
-    int move_gid;
-    int src_proc;
-    int dst_proc;
-};
 
 // the block structure
 struct Block
@@ -83,17 +56,17 @@ struct Block
     int                 gid;
     Bounds              bounds;
     std::vector<double> x;                                              // some block data, e.g.
-    Work                work;                                           // some estimate of how much work this block involves
+    diy::Work           work;                                           // some estimate of how much work this block involves
 };
 
-// auxiliary empty block structure
-struct AuxBlock
+// compile my local work info
+void get_local_work(diy::Master&        master)
 {
-    static void*    create()            { return new AuxBlock; }
-    static void     destroy(void* b)    { delete static_cast<AuxBlock*>(b); }
-};
+    for (auto i = 0; i < master.size(); i++)
+        master.set_work(i, static_cast<Block*>(master.block(i))->work);
+}
 
-// debug: print DynamicAssigner
+// print DynamicAssigner
 void print_dynamic_assigner(const diy::Master&            master,
                             const diy::DynamicAssigner&   dynamic_assigner)
 {
@@ -103,7 +76,7 @@ void print_dynamic_assigner(const diy::Master&            master,
     fmt::print(stderr, "\n");
 }
 
-// debug: print the link for each block
+// print the link for each block
 void print_links(const diy::Master& master)
 {
     for (auto i = 0; i < master.size(); i++)
@@ -117,14 +90,14 @@ void print_links(const diy::Master& master)
     }
 }
 // gather work information from all processes in order to collect summary stats
-void   gather_work_info(const diy::Master&      master,
-                        std::vector<Work>&      local_work,             // work for each local block TODO: eventually internal to master?
-                        std::vector<WorkInfo>&  all_work_info)          // (output) global work info
+void   gather_work_info(const diy::Master&              master,
+                        std::vector<diy::Work>&         local_work,             // work for each local block TODO: eventually internal to master?
+                        std::vector<diy::WorkInfo>&     all_work_info)          // (output) global work info
 {
     auto nlids  = master.size();                    // my local number of blocks
     auto nprocs = master.communicator().size();     // global number of procs
 
-    WorkInfo my_work_info = { master.communicator().rank(), -1, 0, 0, (int)nlids };
+    diy::WorkInfo my_work_info = { master.communicator().rank(), -1, 0, 0, (int)nlids };
 
     // compile my work info
     for (auto i = 0; i < master.size(); i++)
@@ -172,12 +145,12 @@ void   gather_work_info(const diy::Master&      master,
 }
 
 // compute summary stats on work information on root process
-void stats_work_info(const diy::Master&         master,
-                     std::vector<WorkInfo>&     all_work_info)
+void stats_work_info(const diy::Master&             master,
+                     std::vector<diy::WorkInfo>&    all_work_info)
 {
-    Work tot_work = 0;
-    Work max_work = 0;
-    Work min_work = 0;
+    diy::Work tot_work = 0;
+    diy::Work max_work = 0;
+    diy::Work min_work = 0;
     float avg_work;
     float rel_imbalance;
 
@@ -210,8 +183,8 @@ void stats_work_info(const diy::Master&         master,
 // gather summary stats on work information from all processes
 void summary_stats(const diy::Master& master)
 {
-    std::vector<WorkInfo>   all_work_info;
-    std::vector<Work> local_work(master.size());
+    std::vector<diy::WorkInfo>  all_work_info;
+    std::vector<diy::Work>      local_work(master.size());
 
     for (auto i = 0; i < master.size(); i++)
         local_work[i] = static_cast<Block*>(master.block(i))->work;
@@ -219,20 +192,6 @@ void summary_stats(const diy::Master& master)
     gather_work_info(master, local_work, all_work_info);
     if (master.communicator().rank() == 0)
         stats_work_info(master, all_work_info);
-}
-
-// set dynamic assigner blocks to local blocks of master
-// TODO: make a version of DynamicAssigner ctor take master as an arg and do this
-void set_dynamic_assigner(diy::DynamicAssigner&   dynamic_assigner,
-                          diy::Master&            master)
-{
-    std::vector<std::tuple<int, int>> rank_gids(master.size());
-    int rank = master.communicator().rank();
-
-    for (auto i = 0; i < master.size(); i++)
-        rank_gids[i] = std::make_tuple(rank, master.gid(i));
-
-    dynamic_assigner.set_ranks(rank_gids);
 }
 
 
