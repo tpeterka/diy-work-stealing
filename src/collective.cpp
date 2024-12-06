@@ -141,7 +141,7 @@ int main(int argc, char* argv[])
         t0 = MPI_Wtime();
 
         // synchronous collective load balancing
-        diy::load_balance_collective<Block>(master, dynamic_assigner, &get_local_work);
+        diy::load_balance_collective<Block>(master, dynamic_assigner, &get_block_work<Block>);
 
         // timing
         world.barrier();

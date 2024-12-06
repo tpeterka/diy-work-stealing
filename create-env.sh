@@ -13,12 +13,7 @@ spack env create $SPACKENV $YAML
 echo "activating spack environment"
 spack env activate $SPACKENV
 
-# for workstations
-# spack add mpich@4
-
-# for cray machines w/slurm (perlmutter)
 spack add mpich@4
-
 spack add diy@master
 spack add fmt
 spack add spdlog

@@ -119,10 +119,6 @@ int main(int argc, char* argv[])
     // dynamic assigner needs to be fully updated and sync'ed across all procs before proceeding
     world.barrier();
 
-    diy::WorkInfo                my_work_info;
-    std::vector<diy::WorkInfo>   all_work_info;
-    std::vector<diy::WorkInfo>   sample_work_info;
-
     // debug: print each block
 //     master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
 //             { b->show_block(cp); });
@@ -148,7 +144,7 @@ int main(int argc, char* argv[])
         t0 = MPI_Wtime();
 
         // sampling load balancing method
-        diy::load_balance_sampling<Block>(master, static_assigner, dynamic_assigner, &get_local_work, sample_frac, quantile);
+        diy::load_balance_sampling<Block>(master, static_assigner, dynamic_assigner, &get_block_work<Block>, sample_frac, quantile);
 
         // timing
         world.barrier();

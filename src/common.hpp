@@ -7,6 +7,15 @@
 typedef     diy::DiscreteBounds         Bounds;
 typedef     diy::RegularGridLink        RGLink;
 
+struct WorkInfo
+{
+    int         proc_rank;          // mpi rank of this process
+    int         top_gid;            // gid of most expensive block in this process TODO: can be top-k-gids, as long as k is fixed and known by all
+    diy::Work   top_work;           // work of top_gid TODO: can be vector of top-k work, as long as k is fixed and known by all
+    diy::Work   proc_work;          // total work of this process
+    int         nlids;              // local number of blocks in this process
+};
+
 // the block structure
 struct Block
 {
@@ -59,11 +68,11 @@ struct Block
     diy::Work           work;                                           // some estimate of how much work this block involves
 };
 
-// compile my local work info
-void get_local_work(diy::Master&        master)
+// callback function returns the work for a block
+template<class Block>
+diy::Work get_block_work(Block* block)
 {
-    for (auto i = 0; i < master.size(); i++)
-        master.set_work(i, static_cast<Block*>(master.block(i))->work);
+    return block->work;
 }
 
 // print DynamicAssigner
@@ -90,14 +99,14 @@ void print_links(const diy::Master& master)
     }
 }
 // gather work information from all processes in order to collect summary stats
-void   gather_work_info(const diy::Master&              master,
-                        std::vector<diy::Work>&         local_work,             // work for each local block TODO: eventually internal to master?
-                        std::vector<diy::WorkInfo>&     all_work_info)          // (output) global work info
+void gather_work_info(const diy::Master&        master,
+                      std::vector<diy::Work>&   local_work,             // work for each local block
+                      std::vector<WorkInfo>&    all_work_info)          // (output) global work info
 {
     auto nlids  = master.size();                    // my local number of blocks
     auto nprocs = master.communicator().size();     // global number of procs
 
-    diy::WorkInfo my_work_info = { master.communicator().rank(), -1, 0, 0, (int)nlids };
+    WorkInfo my_work_info = { master.communicator().rank(), -1, 0, 0, (int)nlids };
 
     // compile my work info
     for (auto i = 0; i < master.size(); i++)
@@ -115,38 +124,16 @@ void   gather_work_info(const diy::Master&              master,
 //     fmt::print(stderr, "exchange_work_info(): proc_rank {} top_gid {} top_work {} proc_work {} nlids {}\n",
 //             my_work_info.proc_rank, my_work_info.top_gid, my_work_info.top_work, my_work_info.proc_work, my_work_info.nlids);
 
-    // vectors of integers from WorkInfo
-    std::vector<int> my_work_info_vec =
-    {
-        my_work_info.proc_rank,
-        my_work_info.top_gid,
-        my_work_info.top_work,
-        my_work_info.proc_work,
-        my_work_info.nlids
-    };
-    std::vector<std::vector<int>>   all_work_info_vec;
-
     // gather work info
-    diy::mpi::gather(master.communicator(), my_work_info_vec, all_work_info_vec, 0);
-
-    // unpack received info into vector of structs
     if (master.communicator().rank() == 0)
-    {
         all_work_info.resize(nprocs);
-        for (auto i = 0; i < nprocs; i++)
-        {
-            all_work_info[i].proc_rank = all_work_info_vec[i][0];
-            all_work_info[i].top_gid   = all_work_info_vec[i][1];
-            all_work_info[i].top_work  = all_work_info_vec[i][2];
-            all_work_info[i].proc_work = all_work_info_vec[i][3];
-            all_work_info[i].nlids     = all_work_info_vec[i][4];
-        }
-    }
+    diy::mpi::detail::gather(master.communicator(), &my_work_info.proc_rank,
+            sizeof(WorkInfo) / sizeof(WorkInfo::proc_rank), MPI_INT, &all_work_info[0].proc_rank, 0);  // assumes all elements of WorkInfo are sizeof(int)
 }
 
 // compute summary stats on work information on root process
 void stats_work_info(const diy::Master&             master,
-                     std::vector<diy::WorkInfo>&    all_work_info)
+                     std::vector<WorkInfo>&         all_work_info)
 {
     diy::Work tot_work = 0;
     diy::Work max_work = 0;
@@ -183,7 +170,7 @@ void stats_work_info(const diy::Master&             master,
 // gather summary stats on work information from all processes
 void summary_stats(const diy::Master& master)
 {
-    std::vector<diy::WorkInfo>  all_work_info;
+    std::vector<WorkInfo>  all_work_info;
     std::vector<diy::Work>      local_work(master.size());
 
     for (auto i = 0; i < master.size(); i++)
