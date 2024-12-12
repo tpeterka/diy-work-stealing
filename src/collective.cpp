@@ -141,23 +141,16 @@ int main(int argc, char* argv[])
         t0 = MPI_Wtime();
 
         // synchronous collective load balancing
-        diy::load_balance_collective<Block>(master, dynamic_assigner, &get_block_work<Block>);
+        diy::load_balance_collective(master, dynamic_assigner, &get_block_work);
 
         // timing
         world.barrier();
         balance_time += (MPI_Wtime() - t0);
-
-        // debug: print the master of src and dst proc
-//         if (world.rank() == move_info.src_proc)
-//             fmt::print(stderr, "iteration {}: after moving gid {} from src rank {} to dst rank {}, src master size {}\n",
-//                     n, move_info.move_gid, move_info.src_proc, move_info.dst_proc, master.size());
-//         if (world.rank() == move_info.dst_proc)
-//             fmt::print(stderr, "iteration {}: after moving gid {} from src rank {} to dst rank {}, dst master size {}\n",
-//                     n, move_info.move_gid, move_info.src_proc, move_info.dst_proc, master.size());
-//         if (world.rank() == move_info.src_proc || world.rank() == move_info.dst_proc)
-//             for (auto i = 0; i < master.size(); i++)
-//                 fmt::print(stderr, "lid {} gid {}\n", i, master.gid(i));
     }
+
+    // debug: print the master
+//     for (auto i = 0; i < master.size(); i++)
+//         fmt::print(stderr, "lid {} gid {}\n", i, master.gid(i));
 
     world.barrier();                                    // barrier to synchronize clocks over procs, do not remove
     wall_time = MPI_Wtime() - wall_time;

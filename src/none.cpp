@@ -86,17 +86,6 @@ int main(int argc, char* argv[])
                              master.add(gid, b, l);
                          });
 
-    // debug: sanity check that communicator is correct
-//     char hostname[256];
-//     gethostname(hostname, sizeof(hostname));
-//     char libversion[2048];
-//     int len;
-//     MPI_Get_library_version(libversion, &len);
-//     fmt::print(stderr, "comm size {} comm rank {} hostname{}\n",
-//             world.size(), world.rank(), hostname);
-//     if (world.rank() == 0)
-//         fmt::print(stderr, "{}\n", libversion);
-
     // debug: print each block
 //     master.foreach([&](Block* b, const diy::Master::ProxyWithLink& cp)
 //             { b->show_block(cp); });

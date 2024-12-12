@@ -144,7 +144,7 @@ int main(int argc, char* argv[])
         t0 = MPI_Wtime();
 
         // sampling load balancing method
-        diy::load_balance_sampling<Block>(master, static_assigner, dynamic_assigner, &get_block_work<Block>, sample_frac, quantile);
+        diy::load_balance_sampling(master, static_assigner, dynamic_assigner, &get_block_work, sample_frac, quantile);
 
         // timing
         world.barrier();

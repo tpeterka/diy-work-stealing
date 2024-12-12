@@ -69,7 +69,6 @@ struct Block
 };
 
 // callback function returns the work for a block
-template<class Block>
 diy::Work get_block_work(Block* block)
 {
     return block->work;
